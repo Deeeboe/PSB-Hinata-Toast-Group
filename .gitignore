@@ -1,0 +1,16 @@
+# Secrets — NEVER commit
+.vault/
+*.env
+!*.env.example
+*token*.json
+.toast_token_*.json
+
+# Generated briefs contain customer/staff data — never commit
+out/
+*-generated.html
+*-live.html
+
+# Python / OS cruft
+__pycache__/
+*.pyc
+.DS_Store
