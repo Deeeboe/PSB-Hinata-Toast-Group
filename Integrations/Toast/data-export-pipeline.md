@@ -23,13 +23,16 @@ Toast Data Export (AWS Transfer SFTP, daily ~morning)
 - Logs: `exports/run.log`, `exports/launchd.{out,err}.log` (gitignored)
 - Manage: `launchctl unload|load ~/Library/LaunchAgents/com.pitch.toast-export.plist`
 
-**Cloud half (primary, always-on — pending PAT):** a Claude Code routine like the Weekly Ops
-Brief. Cloud has no `.vault`, so secrets come from env vars:
-- `TOAST_SFTP_HOST`, `TOAST_SFTP_USER`, `TOAST_SFTP_KEY_CONTENTS` (the private key text; the
-  pull script writes it to a temp 600 file), `AIRTABLE_PAT`,
-  `AIRTABLE_INVENTORY_BASE=appxC1Dv2VROY8Tlp`, `AIRTABLE_ITEMSALES_TABLE=tblpiyZfDU7TuP9eh`
-- **Network egress:** must allowlist the SFTP host (Custom network, NOT "Trusted" — same gotcha
-  as the Toast REST API per the weekly-ops SKILL).
+**Cloud half (always-on) = GitHub Actions** — `.github/workflows/toast-data-export.yml` in the
+`PSB-Hinata-Toast-Group` repo. Cron `0 19 * * *` (9am HST) + manual dispatch. Runs `run_daily.sh`.
+- ⚠️ **NOT a Claude Code routine:** those run behind an HTTP/HTTPS-only proxy — port 22 (SFTP) is
+  blocked, no setting unlocks it. GitHub runners allow port 22 and ship python3 + sftp.
+- Secrets = **encrypted GitHub repo Secrets** (Settings → Secrets and variables → Actions):
+  `TOAST_SFTP_HOST`, `TOAST_SFTP_USER`, **`TOAST_SFTP_KEY_B64`** (base64 of the DEDICATED cloud
+  key `.vault/toast_sftp_cloud` — base64 avoids multi-line corruption), `AIRTABLE_PAT`,
+  `AIRTABLE_INVENTORY_BASE=appxC1Dv2VROY8Tlp`, `AIRTABLE_ITEMSALES_TABLE=tblpiyZfDU7TuP9eh`.
+  Values staged in `.vault/github-secrets-paste.txt` (600).
+- The cloud uses a **dedicated** Toast SSH key (separate from local → independently revocable).
 
 ## Scripts
 
