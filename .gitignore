@@ -10,6 +10,9 @@ out/
 *-generated.html
 *-live.html
 
+# Toast export data + run logs — never commit (customer/sales data)
+Integrations/Toast/exports/
+
 # Python / OS cruft
 __pycache__/
 *.pyc

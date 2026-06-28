@@ -1,0 +1,41 @@
+name: Toast Data Export
+
+# Always-on cloud runner for the PITCH Toast Data Export pipeline.
+# (Claude Code cloud routines can't do SFTP — their egress is HTTP/HTTPS-proxy
+# only, port 22 blocked. GitHub-hosted runners allow outbound port 22, so the
+# SFTP pull works here.) Mirrors the local launchd job; either can run safely
+# (the load is idempotent — re-running a date updates, never duplicates).
+
+on:
+  schedule:
+    - cron: "0 19 * * *"   # 19:00 UTC = 9:00 AM HST, daily (HST has no DST)
+  workflow_dispatch: {}      # manual "Run workflow" button for testing
+
+# No write permissions needed — the job only reads SFTP + writes to Airtable.
+permissions:
+  contents: read
+
+concurrency:
+  group: toast-data-export
+  cancel-in-progress: false
+
+jobs:
+  pull-and-load:
+    runs-on: ubuntu-latest      # has python3 + sftp (openssh-client) preinstalled
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pull Toast export + load item sales to Airtable
+        env:
+          TOAST_SFTP_HOST:         ${{ secrets.TOAST_SFTP_HOST }}
+          TOAST_SFTP_USER:         ${{ secrets.TOAST_SFTP_USER }}
+          TOAST_SFTP_KEY_CONTENTS: ${{ secrets.TOAST_SFTP_KEY_CONTENTS }}
+          AIRTABLE_PAT:            ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_INVENTORY_BASE: ${{ secrets.AIRTABLE_INVENTORY_BASE }}
+          AIRTABLE_ITEMSALES_TABLE: ${{ secrets.AIRTABLE_ITEMSALES_TABLE }}
+        run: bash Integrations/Toast/run_daily.sh
+
+      - name: Show run log
+        if: always()
+        run: tail -n 40 Integrations/Toast/exports/run.log || echo "(no log produced)"
