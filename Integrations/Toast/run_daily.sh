@@ -1,16 +1,18 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # PITCH — daily Toast Data Export runner (pull + load).
-# Used by BOTH the local launchd job (com.pitch.toast-export) and, as a reference,
-# the cloud routine. The PULL is critical; the LOAD is best-effort (needs the
-# Airtable PAT in .vault/airtable.env — until that exists, the pull still runs
-# and files land locally, so nothing is lost).
+# Used by BOTH the local launchd job (com.pitch.toast-export) and the cloud
+# routine. The PULL is critical; the LOAD is best-effort (needs the Airtable PAT
+# in .vault/airtable.env locally, or AIRTABLE_* env vars in the cloud) — until
+# that exists, the pull still runs and files land locally, so nothing is lost.
 #
 # Logs to Integrations/Toast/exports/run.log (gitignored).
 set -u
 # Resolve paths from THIS script's location so the same file runs locally
-# (~/Projects/PITCH Sports Bar/...) and in the cloud repo clone.
-TOAST="${0:A:h}"          # zsh: absolute dir of this script
-REPO="${TOAST:h:h}"        # two levels up = repo root
+# (~/Projects/PITCH Sports Bar/...) and in the cloud repo clone. Portable across
+# bash (BASH_SOURCE) and zsh (falls back to $0).
+SOURCE="${BASH_SOURCE[0]:-$0}"
+TOAST="$(cd "$(dirname "$SOURCE")" && pwd)"
+REPO="$(cd "$TOAST/../.." && pwd)"
 LOG="$TOAST/exports/run.log"
 mkdir -p "$TOAST/exports"
 
