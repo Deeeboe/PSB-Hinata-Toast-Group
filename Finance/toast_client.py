@@ -13,6 +13,7 @@ PITCH uses TWO credentials:
     token = get_token(creds)                                   # analytics (default)
     token = get_token(creds, "TOAST_STD_CLIENT_ID", "TOAST_STD_CLIENT_SECRET")  # standard
 """
+import http.client
 import json
 import os
 import sys
@@ -45,7 +46,7 @@ def load_env(path=VAULT_ENV):
 
 def _post(url, payload, headers=None):
     data = json.dumps(payload).encode()
-    hdrs = {"Content-Type": "application/json"}
+    hdrs = {"Content-Type": "application/json", "User-Agent": "PITCH-Toast-Client/1.0"}
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
@@ -61,11 +62,32 @@ def _login(creds, id_key, secret_key):
     """Hit Toast's auth endpoint for the given credential. Rate-limited!"""
     host = creds.get("TOAST_API_HOST", "https://ws-api.toasttab.com")
     url = f"{host}/authentication/v1/authentication/login"
-    body = _post(url, {
+    payload = {
         "clientId": creds[id_key],
         "clientSecret": creds[secret_key],
         "userAccessType": "TOAST_MACHINE_CLIENT",
-    })
+    }
+    # Retry transient connection drops. NOTE: Toast enforces <=2 logins/hour/credential
+    # and signals over-limit by DROPPING the connection (surfaces as RemoteDisconnected),
+    # not a clean 4xx. The token cache (get_token) is the real fix — avoid force_login.
+    last_err = None
+    for attempt in range(3):
+        try:
+            body = _post(url, payload)
+            break
+        except urllib.error.HTTPError:
+            raise  # real auth error with a status code — retrying won't help
+        except (http.client.RemoteDisconnected, ConnectionError,
+                urllib.error.URLError, TimeoutError) as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(3 * (attempt + 1))
+    else:
+        raise RuntimeError(
+            f"Toast login connection dropped after retries ({type(last_err).__name__}: {last_err}). "
+            "Usually a transient blip OR Toast's rate limit (<=2 logins/hour/credential) closing the "
+            "connection. Reuse the cached token (don't force_login); if needed, wait ~30 min."
+        )
     tok = body.get("token", {})
     if isinstance(tok, dict):
         token = tok.get("accessToken") or tok.get("access_token")
