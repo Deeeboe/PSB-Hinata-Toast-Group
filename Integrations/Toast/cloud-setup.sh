@@ -7,7 +7,10 @@
 # archive.ubuntu.com + security.ubuntu.com to Allowed domains.
 set -e
 if ! command -v sftp >/dev/null 2>&1; then
-  apt-get update
+  # Unrelated third-party PPAs (deadsnakes/php) baked into the image 403 and are
+  # not needed; don't let them abort. The main Ubuntu repos (which carry
+  # openssh-client) update fine, so the install still succeeds.
+  apt-get update || true
   apt-get install -y openssh-client
 fi
 sftp -V || true   # print version to confirm it's present
