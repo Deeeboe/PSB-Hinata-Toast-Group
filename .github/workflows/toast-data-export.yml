@@ -28,9 +28,9 @@ jobs:
 
       - name: Pull Toast export + load item sales to Airtable
         env:
-          TOAST_SFTP_HOST:         ${{ secrets.TOAST_SFTP_HOST }}
-          TOAST_SFTP_USER:         ${{ secrets.TOAST_SFTP_USER }}
-          TOAST_SFTP_KEY_CONTENTS: ${{ secrets.TOAST_SFTP_KEY_CONTENTS }}
+          TOAST_SFTP_HOST:    ${{ secrets.TOAST_SFTP_HOST }}
+          TOAST_SFTP_USER:    ${{ secrets.TOAST_SFTP_USER }}
+          TOAST_SFTP_KEY_B64: ${{ secrets.TOAST_SFTP_KEY_B64 }}
           AIRTABLE_PAT:            ${{ secrets.AIRTABLE_PAT }}
           AIRTABLE_INVENTORY_BASE: ${{ secrets.AIRTABLE_INVENTORY_BASE }}
           AIRTABLE_ITEMSALES_TABLE: ${{ secrets.AIRTABLE_ITEMSALES_TABLE }}

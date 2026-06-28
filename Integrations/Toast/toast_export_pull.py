@@ -64,11 +64,19 @@ def load_env():
 
 
 def resolve_key(env):
-    # Cloud runs have no .vault: if the key is supplied as an env var
-    # (TOAST_SFTP_KEY_CONTENTS), materialize it to a temp 600 file.
+    # Cloud runs have no .vault: materialize the key from an env var to a temp
+    # 600 file. PREFER base64 (TOAST_SFTP_KEY_B64) — single line, immune to the
+    # newline mangling that corrupts raw multi-line keys passed via secrets.
+    import tempfile
+    b64 = env.get("TOAST_SFTP_KEY_B64", "")
+    if b64.strip():
+        import base64
+        tmp = Path(tempfile.gettempdir()) / "toast_sftp_key"
+        tmp.write_bytes(base64.b64decode("".join(b64.split())))
+        tmp.chmod(0o600)
+        return tmp
     contents = env.get("TOAST_SFTP_KEY_CONTENTS", "")
     if contents.strip():
-        import tempfile
         tmp = Path(tempfile.gettempdir()) / "toast_sftp_key"
         tmp.write_text(contents.replace("\\n", "\n").rstrip() + "\n")
         tmp.chmod(0o600)
