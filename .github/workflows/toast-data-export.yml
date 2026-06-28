@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest      # has python3 + sftp (openssh-client) preinstalled
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Pull Toast export + load item sales to Airtable
         env:
