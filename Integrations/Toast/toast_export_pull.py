@@ -101,6 +101,9 @@ def build_sftp_cmd(env, debug):
         "-i", str(key),
         "-P", port,
         "-o", "BatchMode=yes",                       # never prompt (key-only, unattended)
+        "-o", "ConnectTimeout=30",                   # fail fast if egress to SFTP is blocked
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=4",
         "-o", "StrictHostKeyChecking=accept-new",    # accept Toast's host key on first run, pin after
         "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
         f"{user}@{host}",
@@ -109,11 +112,16 @@ def build_sftp_cmd(env, debug):
 
 
 def run(env, batch_script, debug, allow_fail=False):
+    # Cloud clones have no .vault dir, so the known_hosts path can't be written
+    # and sftp aborts. Ensure the parent exists (ephemeral in cloud, that's fine).
+    KNOWN_HOSTS.parent.mkdir(parents=True, exist_ok=True)
     cmd = build_sftp_cmd(env, debug)
     if debug:
         print("→ sftp command:", " ".join(cmd), file=sys.stderr)
         print("→ batch:\n" + batch_script, file=sys.stderr)
-    proc = subprocess.run(cmd, input=batch_script, capture_output=True, text=True)
+    # Hard timeout so a blocked-egress hang fails fast instead of running forever.
+    proc = subprocess.run(cmd, input=batch_script, capture_output=True, text=True,
+                          timeout=120)
     if proc.returncode != 0 and not allow_fail:
         # surface the real error — do NOT swallow (house rule)
         print(proc.stdout)

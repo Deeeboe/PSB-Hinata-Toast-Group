@@ -20,16 +20,18 @@ mkdir -p "$TOAST/exports"
 echo "===== run $(date '+%Y-%m-%d %H:%M:%S %Z') =====" >> "$LOG"
 
 # 1) PULL (critical) — grab the latest date folder from Toast SFTP.
-if /usr/bin/python3 "$TOAST/toast_export_pull.py" >> "$LOG" 2>&1; then
+if python3 "$TOAST/toast_export_pull.py" >> "$LOG" 2>&1; then
   echo "pull: OK" >> "$LOG"
 else
-  echo "pull: FAILED (see above)" >> "$LOG"
+  echo "pull: FAILED — capturing --debug handshake below" >> "$LOG"
+  python3 "$TOAST/toast_export_pull.py" --list --debug >> "$LOG" 2>&1 || true
   exit 1   # no point loading if the pull failed
 fi
 
-# 2) LOAD (best-effort) — item-sales -> Airtable. Skips cleanly if no PAT yet.
-if [ -f "$REPO/.vault/airtable.env" ]; then
-  if /usr/bin/python3 "$TOAST/toast_load_itemsales.py" >> "$LOG" 2>&1; then
+# 2) LOAD (best-effort) — item-sales -> Airtable.
+# Run if creds are available either as the local vault file OR as env vars (cloud).
+if [ -f "$REPO/.vault/airtable.env" ] || [ -n "${AIRTABLE_PAT:-}" ]; then
+  if python3 "$TOAST/toast_load_itemsales.py" >> "$LOG" 2>&1; then
     echo "load: OK" >> "$LOG"
   else
     echo "load: FAILED (see above)" >> "$LOG"
