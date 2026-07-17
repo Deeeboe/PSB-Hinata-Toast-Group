@@ -22,10 +22,24 @@ Credentials come from .vault/toast-sftp.env (gitignored, never in chat):
 
 Usage:
     python3 toast_export_pull.py --list             # show the remote date folders
-    python3 toast_export_pull.py                     # pull the LATEST date folder
+    python3 toast_export_pull.py                     # SYNC: pull every day we're missing
     python3 toast_export_pull.py --date 20260627     # pull one specific date
-    python3 toast_export_pull.py --all               # mirror every date folder
+    python3 toast_export_pull.py --all               # force re-pull of every date folder
     python3 toast_export_pull.py --debug             # verbose: prints the sftp command + -v output
+
+⚠️ WHY SYNC IS THE DEFAULT (fixed 2026-07-13 — this bug cost us a week of sales data):
+Toast keeps only ~7 days of date folders on the SFTP server. The old default pulled
+ONLY the latest folder, so any missed/failed run meant that day was skipped and then
+rotated off the server FOREVER. It also mkdir'd the destination before pulling, so a
+failed pull left an EMPTY folder behind that looked "present" and was never retried.
+Result: 7/7, 7/10 and 7/12 never landed, 7/9 was an empty shell, and the weekly report
+couldn't answer net sales.
+
+Now the default compares every remote date against what's on disk and pulls anything
+missing OR incomplete (fewer files locally than remotely — which covers the empty-shell
+case). That makes the job self-healing: one bad night is repaired by the next run, as
+long as it happens inside Toast's retention window. Days that fall outside that window
+are reported as PERMANENTLY LOST so they never silently read as zero.
 
 Per house rule (pitch-script-debug-rule): real errors surface — nothing is
 silently swallowed, and --debug shows exactly what ran.
@@ -160,28 +174,131 @@ def list_names(env, remote_path, debug):
     return [n for n in names if n]
 
 
-def restaurant_dir(env, debug):
-    """The single <RESTAURANT_ID> folder at the SFTP root."""
+# TWO locations live at the SFTP root — this matters more than it looks:
+#   86897  = PITCH Sports Bar   (the floor: bar, kitchen, sushi — the real sales)
+#   230312 = Hinata Catering    (catering / mobile sushi / bento only — a few orders a day)
+# The old code did `roots[0]`, which sorts to 230312, so for weeks we pulled HINATA
+# and stored it as if it were PITCH. Every sales read came back ~$0 and looked like a
+# broken feed. It wasn't — it was the wrong restaurant. Never index into roots again.
+LOCATIONS = {
+    "86897":  {"name": "PITCH",  "dest": lambda: LOCAL_DIR},
+    "230312": {"name": "Hinata", "dest": lambda: LOCAL_DIR / "hinata"},
+}
+PITCH_ID = "86897"
+
+
+def restaurant_dirs(env, debug):
+    """Every <RESTAURANT_ID> folder at the SFTP root, mapped to its local destination."""
     roots = list_names(env, ".", debug)
     if not roots:
         sys.exit("❌ Connected, but the SFTP root is empty. Is Data Export enabled + has it run yet?")
-    return roots[0]
+    unknown = [r for r in roots if r not in LOCATIONS]
+    if unknown:
+        print(f"⚠️  Unrecognized location folder(s) on the server: {', '.join(unknown)} — "
+              f"add them to LOCATIONS in this file or they'll be skipped.", file=sys.stderr)
+    known = [r for r in roots if r in LOCATIONS]
+    if PITCH_ID not in known:
+        sys.exit(f"❌ PITCH's folder ({PITCH_ID}) is NOT on the server. Found: {', '.join(roots)}.\n"
+                 f"   Refusing to run — pulling only Hinata is what caused the $0-sales bug.")
+    return known
 
 
-def date_folders(env, debug):
-    rid = restaurant_dir(env, debug)
-    dates = sorted(d for d in list_names(env, rid, debug) if d.isdigit() and len(d) == 8)
-    return rid, dates
+def dest_for(rid):
+    return LOCATIONS[rid]["dest"]()
 
 
-def pull_date(env, rid, date, debug):
-    dest = LOCAL_DIR / date
+def date_folders(env, rid, debug):
+    return sorted(d for d in list_names(env, rid, debug) if d.isdigit() and len(d) == 8)
+
+
+def pull_date(env, rid, date, debug, expected=None):
+    dest = dest_for(rid) / date
     dest.mkdir(parents=True, exist_ok=True)
     script = f'lcd "{dest}"\ncd {rid}/{date}\nget *\n'
     run(env, script, debug)
     got = sorted(p.name for p in dest.iterdir() if p.is_file())
-    print(f"  ✅ {date}: {len(got)} files → {dest}")
+    if expected is not None and len(got) < expected:
+        # Don't pretend this worked. Leaving the partial folder is fine — the next
+        # sync sees the short count and retries it.
+        print(f"  ⚠️  {date}: got {len(got)} of {expected} files — INCOMPLETE, will retry next run")
+    else:
+        print(f"  ✅ {date}: {len(got)} files → {dest}")
     return got
+
+
+def local_count(rid, date):
+    d = dest_for(rid) / date
+    if not d.is_dir():
+        return 0
+    return sum(1 for p in d.iterdir() if p.is_file())
+
+
+def sync(env, rid, dates, debug):
+    """Pull every remote date for this location we don't already have complete on disk.
+
+    A local folder counts as complete only when it holds at least as many files as
+    the remote one. That single check covers both failure modes we've actually hit:
+    the folder never being pulled, and a failed pull leaving an empty shell behind.
+    """
+    label = LOCATIONS[rid]["name"]
+    print(f"\n=== {label} ({rid}) → {dest_for(rid)} ===")
+    print(f"Syncing {len(dates)} remote date folders against local…")
+    pulled, ok, incomplete = [], [], []
+
+    for d in dates:
+        remote_n = len(list_names(env, f"{rid}/{d}", debug))
+        have = local_count(rid, d)
+        if have >= remote_n and remote_n > 0:
+            ok.append(d)
+            if debug:
+                print(f"  [debug] {d}: have {have}/{remote_n} — up to date", file=sys.stderr)
+            continue
+        why = "missing" if have == 0 else f"incomplete ({have}/{remote_n})"
+        print(f"  ↓ {d}: {why} — pulling")
+        got = pull_date(env, rid, d, debug, expected=remote_n)
+        (pulled if len(got) >= remote_n else incomplete).append(d)
+
+    print(f"  up to date : {len(ok)}")
+    print(f"  backfilled : {len(pulled)}" + (f"  → {', '.join(pulled)}" if pulled else ""))
+    if incomplete:
+        print(f"  ⚠️ INCOMPLETE: {', '.join(incomplete)} — will retry next run")
+
+    report_lost(rid, dates)
+    return pulled
+
+
+def report_lost(rid, remote_dates):
+    """Days that are gone: not on disk, and no longer on the server to re-pull.
+
+    Toast's retention window is ~7 days, so anything older that we never captured is
+    unrecoverable. Say so loudly — a silent hole reads as a $0 sales day.
+    """
+    from datetime import date as _date, timedelta
+
+    root = dest_for(rid)
+    if not root.is_dir():
+        return
+    have = {d for d in (p.name for p in root.iterdir() if p.is_dir())
+            if d.isdigit() and len(d) == 8 and local_count(rid, d) > 0}
+    if not have and not remote_dates:
+        return
+    known = sorted(have | set(remote_dates))
+    start = _date.fromisoformat(f"{known[0][:4]}-{known[0][4:6]}-{known[0][6:]}")
+    yesterday = _date.today() - timedelta(days=1)
+
+    lost, day = [], start
+    while day <= yesterday:
+        s = day.strftime("%Y%m%d")
+        if s not in have and s not in remote_dates:
+            lost.append(s)
+        day += timedelta(days=1)
+
+    if lost:
+        print(f"\n  🔴 PERMANENTLY LOST ({len(lost)}) — past Toast's ~7-day retention, "
+              f"cannot be re-pulled:")
+        print(f"     {', '.join(lost)}")
+        print(f"     For sales on these days use the live API instead: "
+              f"Finance/toast_weekly_sales.py <start> <end>")
 
 
 def main():
@@ -189,39 +306,46 @@ def main():
     debug = "--debug" in args
     env = load_env()
 
+    rids = restaurant_dirs(env, debug)
+
     if "--list" in args:
-        rid, dates = date_folders(env, debug)
-        print(f"Restaurant folder: {rid}")
-        print(f"Date folders available ({len(dates)}):")
-        for d in dates:
-            print(f"  {d}")
-        if dates:
-            print(f"\nLatest: {dates[-1]}.  Pull it with:  python3 {Path(__file__).name}")
+        for rid in rids:
+            dates = date_folders(env, rid, debug)
+            print(f"\n{LOCATIONS[rid]['name']} ({rid}) → {dest_for(rid)}")
+            print(f"  date folders available ({len(dates)}): {', '.join(dates)}")
         return
 
-    rid, dates = date_folders(env, debug)
-    if not dates:
-        sys.exit("❌ No date folders found yet under the restaurant folder.")
+    # --pitch / --hinata narrow the run to one location; default does both.
+    if "--pitch" in args:
+        rids = [PITCH_ID]
+    elif "--hinata" in args:
+        rids = [r for r in rids if r != PITCH_ID]
 
-    if "--all" in args:
-        print(f"Mirroring all {len(dates)} date folders…")
-        for d in dates:
+    for rid in rids:
+        dates = date_folders(env, rid, debug)
+        if not dates:
+            print(f"⚠️  {LOCATIONS[rid]['name']} ({rid}): no date folders on the server yet.")
+            continue
+
+        if "--all" in args:
+            print(f"\n=== {LOCATIONS[rid]['name']} ({rid}) === force re-pulling all {len(dates)}…")
+            for d in dates:
+                pull_date(env, rid, d, debug)
+        elif "--date" in args:
+            i = args.index("--date")
+            if i + 1 >= len(args):
+                sys.exit("❌ --date needs a value, e.g. --date 20260627")
+            d = args[i + 1]
+            if d not in dates:
+                sys.exit(f"❌ {d} not on the server for {rid}. Available: {', '.join(dates)}")
+            print(f"\n=== {LOCATIONS[rid]['name']} ({rid}) === pulling {d}…")
             pull_date(env, rid, d, debug)
-    elif "--date" in args:
-        i = args.index("--date")
-        if i + 1 >= len(args):
-            sys.exit("❌ --date needs a value, e.g. --date 20260627")
-        d = args[i + 1]
-        if d not in dates:
-            sys.exit(f"❌ {d} not on the server. Available: {', '.join(dates)}")
-        print(f"Pulling {d}…")
-        pull_date(env, rid, d, debug)
-    else:
-        latest = dates[-1]
-        print(f"Pulling latest date folder: {latest}…")
-        pull_date(env, rid, latest, debug)
+        else:
+            # Default is SYNC across BOTH locations. See the module docstring — pulling
+            # one folder blindly (and it being the wrong one) is the whole bug history here.
+            sync(env, rid, dates, debug)
 
-    print(f"\n✅ Done. Local data lives in {LOCAL_DIR}")
+    print(f"\n✅ Done. PITCH → {LOCAL_DIR}   ·   Hinata → {LOCAL_DIR / 'hinata'}")
 
 
 if __name__ == "__main__":
