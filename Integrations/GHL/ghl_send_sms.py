@@ -56,20 +56,38 @@ def _get(url, pit):
 
 
 def get_recent_messages(contact_id, limit=30):
-    """Return recent messages for a contact's conversation: [{direction, body}]."""
+    """Return up to `limit` recent messages for a contact's conversation:
+    [{direction, body}].
+
+    PAGINATES. The messages endpoint returns ~20 per page by default, and the old
+    version just sliced that single page — so `limit=50` silently gave you ~20.
+    On a busy thread that window is only a few hours, which made dedup markers
+    disappear and caused duplicate catering-approval blasts to the chefs.
+    """
     pit, loc, _ = _creds()
     s = _get(f"{BASE}/conversations/search?locationId={loc}&contactId={contact_id}", pit)
     convs = s.get("conversations", []) if isinstance(s, dict) else []
     if not convs:
         return []
     conv_id = convs[0]["id"]
-    m = _get(f"{BASE}/conversations/{conv_id}/messages", pit)
-    arr = m.get("messages", {})
-    arr = arr.get("messages", []) if isinstance(arr, dict) else (arr if isinstance(arr, list) else [])
-    out = []
-    for msg in arr[:limit]:
-        out.append({"direction": msg.get("direction"), "body": msg.get("body") or ""})
-    return out
+    out, last_id, guard = [], None, 0
+    while len(out) < limit and guard < 12:
+        url = f"{BASE}/conversations/{conv_id}/messages?limit=100"
+        if last_id:
+            url += f"&lastMessageId={last_id}"
+        m = _get(url, pit)
+        arr = m.get("messages", {})
+        arr = arr.get("messages", []) if isinstance(arr, dict) else (arr if isinstance(arr, list) else [])
+        if not arr:
+            break
+        for msg in arr:
+            out.append({"direction": msg.get("direction"), "body": msg.get("body") or ""})
+        nxt = arr[-1].get("id")
+        if not nxt or nxt == last_id:
+            break
+        last_id = nxt
+        guard += 1
+    return out[:limit]
 
 
 def thread_has(contact_id, *substrings, direction=None, limit=30):

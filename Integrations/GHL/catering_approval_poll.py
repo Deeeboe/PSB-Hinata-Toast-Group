@@ -158,8 +158,21 @@ def main():
             continue
         cands.append(o)
 
-    # read Derrick's thread ONCE; derive state per order from it
-    derrick_msgs = get_recent_messages(DERRICK, limit=50)
+    # read Derrick's thread ONCE; derive state per order from it.
+    # 200, not 50: an order can sit for days between the heads-up and approval, and
+    # this thread is busy (call recaps, omakase alerts, CCs). Too small a window
+    # makes the "already sent" marker scroll out and the chefs get blasted again.
+    derrick_msgs = get_recent_messages(DERRICK, limit=200)
+
+    # FAIL SAFE (do not remove): an empty read means we could not SEE the thread,
+    # it does NOT mean nothing was ever sent. Without this guard, one transient GHL
+    # hiccup makes every marker look absent and this script re-sends every pending
+    # order to every chef. Silence is the safe failure here.
+    if not derrick_msgs:
+        print("ABORT: could not read Derrick's GHL thread (empty response). "
+              "Sending NOTHING this run so already-approved orders are not re-blasted. "
+              "Will retry next hour.")
+        return
     def has(*subs, direction=None):
         for m in derrick_msgs:
             if direction and m["direction"] != direction:
