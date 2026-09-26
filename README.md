@@ -8,6 +8,8 @@ Minimal code + template that a **scheduled cloud agent** uses to regenerate the 
   in the cloud (no local vault present), or `.vault/toast.env` when run locally.
 - `Finance/toast_catering.py` — combined PITCH + Hinata catering pull from the Toast Orders API.
 - `templates/weekly-ops-template.html` — de-identified 6-tab brief skeleton (styling + structure only).
+- `templates/email-reply-rules.md` — canonical drafting rules + reply templates for the info@
+  inbox / catering inbox drafter routine (no customer data, rules and copy only).
 
 **NOT in this repo, on purpose:** no secrets, no employee PII (phone numbers), no customer data.
 Those stay on the local machine. Generated briefs (which DO contain customer names) are git-ignored.
