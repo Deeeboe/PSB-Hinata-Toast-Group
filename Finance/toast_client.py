@@ -13,10 +13,12 @@ PITCH uses TWO credentials:
     token = get_token(creds)                                   # analytics (default)
     token = get_token(creds, "TOAST_STD_CLIENT_ID", "TOAST_STD_CLIENT_SECRET")  # standard
 """
+import hashlib
 import http.client
 import json
 import os
 import sys
+import tempfile
 import time
 import urllib.request
 import urllib.error
@@ -25,6 +27,7 @@ from pathlib import Path
 VAULT     = Path(__file__).resolve().parent.parent / ".vault"
 VAULT_ENV = VAULT / "toast.env"
 EXPIRY_SKEW_SECONDS = 120
+MAX_LOGINS_PER_HOUR = 2   # Toast's documented limit per credential
 
 
 def load_env(path=VAULT_ENV):
@@ -54,8 +57,59 @@ def _post(url, payload, headers=None):
         return json.loads(resp.read())
 
 
+def _cache_dir():
+    """Where token caches live. LOCAL: the .vault (gitignored). CLOUD: no vault exists, so
+    the old code's write silently failed and every run re-logged in (burning the <=2/hr budget);
+    fall back to a writable cache dir instead. Overridable with TOAST_CACHE_DIR. Always created."""
+    override = os.environ.get("TOAST_CACHE_DIR")
+    if override:
+        d = Path(override)
+    elif VAULT.exists():
+        d = VAULT
+    else:
+        d = Path.home() / ".cache" / "pitch-toast"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"[toast] cache dir {d} not creatable ({e}); using temp dir", file=sys.stderr)
+        d = Path(tempfile.gettempdir())
+    return d
+
+
 def _cache_path(client_id):
-    return VAULT / f".toast_token_{client_id[:10]}.json"
+    # hash the FULL id (client_id[:10] could collide between two credentials)
+    h = hashlib.sha1(client_id.encode()).hexdigest()[:16]
+    return _cache_dir() / f".toast_token_{h}.json"
+
+
+def _read_cache(path):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _write_cache(path, data):
+    """Atomic write (temp file + os.replace) so a concurrent reader never sees a torn file.
+    Non-fatal on failure, but LOUD to stderr (no silent swallow, per the repo's ?debug rule)."""
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tok", suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)   # atomic rename
+        tmp = None
+    except Exception as e:
+        print(f"[toast] token cache write failed ({e}); continuing without cache", file=sys.stderr)
+    finally:
+        if tmp and os.path.exists(tmp):
+            try: os.unlink(tmp)
+            except OSError: pass
+
+
+def _recent_logins(cached, now):
+    return [t for t in (cached.get("logins") or []) if now - t < 3600]
 
 
 def _login(creds, id_key, secret_key):
@@ -106,21 +160,26 @@ def get_token(creds=None, id_key="TOAST_CLIENT_ID", secret_key="TOAST_CLIENT_SEC
     creds = creds or load_env()
     client_id = creds.get(id_key, "")
     if not client_id:
-        raise RuntimeError(f"{id_key} is blank in .vault/toast.env")
-    cache = _cache_path(client_id)
-    if not force_login and cache.exists():
-        try:
-            cached = json.loads(cache.read_text())
-            if cached.get("token") and cached.get("expires_at", 0) - EXPIRY_SKEW_SECONDS > time.time():
-                return cached["token"]
-        except Exception:
-            pass  # corrupt cache -> re-login
+        raise RuntimeError(f"{id_key} is blank (checked .vault/toast.env and TOAST_* env vars)")
+    path = _cache_path(client_id)
+    cached = _read_cache(path)
+    now = time.time()
+    if not force_login and cached.get("token") \
+            and cached.get("expires_at", 0) - EXPIRY_SKEW_SECONDS > now:
+        return cached["token"]
+
+    # Rate guard: refuse a login that would exceed Toast's <=2/hour/credential, rather than
+    # attempting a 3rd that Toast rejects by dropping the connection (which also burns the budget).
+    recent = _recent_logins(cached, now)
+    if len(recent) >= MAX_LOGINS_PER_HOUR:
+        wait = int((3600 - (now - min(recent))) / 60) + 1
+        raise RuntimeError(
+            f"Refusing to log in: {len(recent)} logins in the last hour already hit Toast's "
+            f"<=2/hour/credential limit. Reuse the cached token or wait ~{wait} min."
+        )
+
     token, expires_at = _login(creds, id_key, secret_key)
-    try:
-        cache.write_text(json.dumps({"token": token, "expires_at": expires_at}))
-        cache.chmod(0o600)
-    except Exception:
-        pass  # caching is best-effort
+    _write_cache(path, {"token": token, "expires_at": expires_at, "logins": recent + [now]})
     return token
 
 
