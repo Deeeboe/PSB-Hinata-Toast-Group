@@ -4,20 +4,18 @@ catering_approval_poll.py — autonomous catering-approval poller (Phase 2, LIVE
 
 Reads tentative catering orders off the PITCH Private Calendar (events dumped to
 a JSON file by the cloud routine via the Calendar MCP), classifies the dept,
-flags URGENT, and runs the HEADS-UP HOLD flow (Derrick 2026-06-29):
+flags URGENT, and sends the approval to the chefs (Darin + Jon Jon + Nixon)
+the FIRST time an order is seen, CC Derrick + Keita (Derrick 2026-10-18: drop the
+1-hour heads-up/HOLD window; orders entered in Toast have been accurate).
 
-  Run 1 (first time an order is seen): text Derrick a preview heads-up.
-  Run 2+ (next hourly check): if Derrick has NOT replied "HOLD <order#>",
-          send the approval to the chefs (Darin + Jon Jon + Nixon) and CC
-          Derrick + Keita. If he replied HOLD, hold and skip.
-          (Keyword is HOLD, not STOP — STOP is the carrier opt-out word and
-          would unsubscribe Derrick's number entirely instead of vetoing one send.)
+  Legacy: an order that already got the old "🆕" heads-up and that Derrick
+  replied "HOLD <order#>" to stays held. Nothing new asks for HOLD anymore.
+  (This is staff-only: chefs, Derrick, Keita. It never contacts a customer.)
 
 State is tracked STATELESSLY by reading Derrick's own GHL thread (survives fresh
 cloud runs — no state file to lose):
-  - heads-up already sent?  -> his thread has an outbound "🆕 ... #NNNN"
   - already sent to chefs?   -> his thread has an outbound "CC (sent ... #NNNN"
-  - Derrick said hold?       -> his thread has an inbound "HOLD ... NNNN"
+  - legacy hold?             -> his thread has an inbound "HOLD ... NNNN"
 
 GO-LIVE CUTOFF: only orders whose calendar event was CREATED after GOLIVE_AFTER
 are ever acted on, so the existing backlog of tentatives is grandfathered and
@@ -127,14 +125,6 @@ def approval_text(o, today):
             f"Reply YES {o['orderNo']} to approve, or flag any issue. 🤙🏽")
 
 
-def headsup_text(o, today):
-    day, ready = fmt_ready(o["startDateTime"])
-    u = " 🔴 URGENT" if is_urgent(event_date(o["startDateTime"]), today) else ""
-    return (f"🆕 NEW CATERING TENTATIVE{u}\n{o['customer']} · {day} · ready {ready}\n"
-            f"→ {o['dept']}: {summary(o['itemsText'])}\n#{o['orderNo']} · {head_count(o)}\n"
-            f"Sending to the chefs at the next check (~1hr) unless you reply HOLD {o['orderNo']}. 🤙🏽")
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--events", required=True)
@@ -188,28 +178,20 @@ def main():
         if has("CC (SENT", no):
             actions.append(f"#{no} {o['customer']}: already sent to chefs — skip")
             continue
-        if has("🆕", no):  # heads-up already went out
-            if has("HOLD", no, direction="inbound"):
-                actions.append(f"#{no} {o['customer']}: HOLD by Derrick — held")
-                continue
-            # promote: send to chefs + CC
-            msg = approval_text(o, today)
-            cc = f"📋 CC (sent to Darin/Jon Jon/Nixon) #{no}\n" + msg
-            if a.dry:
-                actions.append(f"#{no} {o['customer']}: WOULD SEND to chefs now")
-            else:
-                for cid in CHEFS.values():
-                    send_sms(cid, msg)
-                send_sms(DERRICK, cc)
-                send_sms(KEITA, cc)
-                actions.append(f"#{no} {o['customer']}: SENT to chefs ✅")
+        if has("HOLD", no, direction="inbound"):  # legacy holds from the old heads-up flow
+            actions.append(f"#{no} {o['customer']}: HOLD by Derrick — held")
+            continue
+        # first sighting -> straight to the chefs, CC Derrick + Keita (no heads-up wait)
+        msg = approval_text(o, today)
+        cc = f"📋 CC (sent to Darin/Jon Jon/Nixon) #{no}\n" + msg
+        if a.dry:
+            actions.append(f"#{no} {o['customer']}: WOULD SEND to chefs now")
         else:
-            # first sighting -> heads-up to Derrick
-            if a.dry:
-                actions.append(f"#{no} {o['customer']}: WOULD send heads-up to Derrick")
-            else:
-                send_sms(DERRICK, headsup_text(o, today))
-                actions.append(f"#{no} {o['customer']}: heads-up sent to Derrick 🆕")
+            for cid in CHEFS.values():
+                send_sms(cid, msg)
+            send_sms(DERRICK, cc)
+            send_sms(KEITA, cc)
+            actions.append(f"#{no} {o['customer']}: SENT to chefs ✅")
 
     # report
     print(f"Ran {now.strftime('%Y-%m-%d %H:%M HST')}. {len(events)} events, "
