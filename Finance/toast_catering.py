@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Combined upcoming catering — PITCH + Hinata — from the Toast Orders API.
 
-Pulls source=="Catering" orders across BOTH restaurant GUIDs for the next N days
+Pulls catering orders (source "Catering" = invoiced, "Catering Online Ordering" =
+website orders) across BOTH restaurant GUIDs for the next N days
 (by event/business date), merges them, and prints one clean chronological list.
 
 Usage:
@@ -23,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from toast_client import load_env, get_token
 
+CATERING_SOURCES = ("catering", "catering online ordering")  # invoiced + website orders
 HST_OFFSET = timedelta(hours=10)  # Hawaii Standard Time = UTC-10, no DST
 
 
@@ -104,7 +106,7 @@ def collect(days):
         for name, guid in locations:
             try:
                 for o in fetch_day(host, token, guid, bdate):
-                    if str(o.get("source", "")).lower() == "catering":
+                    if str(o.get("source", "")).lower() in CATERING_SOURCES:
                         rows.append(order_row(o, name))
             except RuntimeError as e:
                 errors.append(f"{name} {bdate}: {e}")
@@ -136,7 +138,8 @@ def main():
         return
     for r in rows:
         print(f"  {fmt_local(r['when']):<17} [{r['restaurant']:<6}] #{r['number'] or '—':<7} "
-              f"{r['customer'][:24]:<24} ${r['amount']:,.2f}")
+              f"{r['customer'][:24]:<24} ${r['amount']:,.2f}"
+              f"{'  (online)' if 'online' in str(r['source']).lower() else ''}")
         if r["items"]:
             print(f"       {', '.join(r['items'][:8])}")
     total = sum(r["amount"] for r in rows)
