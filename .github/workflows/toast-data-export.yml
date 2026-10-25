@@ -11,9 +11,12 @@ on:
     - cron: "0 19 * * *"   # 19:00 UTC = 9:00 AM HST, daily (HST has no DST)
   workflow_dispatch: {}      # manual "Run workflow" button for testing
 
-# No write permissions needed — the job only reads SFTP + writes to Airtable.
+# contents: read for checkout. actions: write ONLY so the keepalive step below can
+# re-enable this workflow (GitHub auto-disables schedules after 60 days with no
+# commits; that silently killed this job 2026-09-16 to 2026-10-24).
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: toast-data-export
@@ -39,3 +42,9 @@ jobs:
       - name: Show run log
         if: always()
         run: tail -n 40 Integrations/Toast/exports/run.log || echo "(no log produced)"
+
+      - name: Keepalive (stop GitHub's 60-day inactivity auto-disable)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/toast-data-export.yml/enable" && echo "keepalive OK"
