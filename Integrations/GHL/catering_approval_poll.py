@@ -44,7 +44,10 @@ CONFIRMED = re.compile(r"Catering order status:\s*Confirmed", re.I)
 LEAD = re.compile(r"Lead status:", re.I)
 ORDERNO = re.compile(r"#(\d{4,})")
 GUESTS = re.compile(r"Guest count:\s*(\d+)", re.I)
-SUSHI = re.compile(r"\b(sushi|sashimi|nigiri|maki|temaki|hand\s?roll|handroll|gunkan|chirashi|barazushi|matsuri)\b", re.I)
+# hand-roll fillings too: Toast lists them by filling ("Spicy Tuna", "Imi Crab Mayo", "Negi Hamachi"), so
+# without these a sushi-only order fell through to "Hot" (#001674, #001502).
+SUSHI = re.compile(r"\b(sushi|sashimi|nigiri|maki|temaki|hand\s?roll|handroll|gunkan|chirashi|barazushi|matsuri"
+                   r"|tuna|hamachi|salmon|imi\s?crab|tobiko|ikura|unagi|natt?ou?|kyuri)\b", re.I)
 BENTO = re.compile(r"\bbento\b", re.I)
 BENTO_SKU = re.compile(r"\$\d{1,2}\s?[A-Z]\b")
 HOT = re.compile(r"\b(pan|pans|chicken|ribeye|noodles|rice|fries|tots|gyoza|edamame|pork|brussel|wings|skins|rinds|waffle|chop|salad)\b", re.I)
@@ -125,6 +128,16 @@ def approval_text(o, today):
             f"Reply YES {o['orderNo']} to approve, or flag any issue. 🤙🏽")
 
 
+def _try_send(contact_id, message):
+    """send_sms, but one failed recipient can't abort the run (send_sms sys.exits on HTTP errors)."""
+    try:
+        send_sms(contact_id, message)
+        return True
+    except (SystemExit, Exception) as e:
+        print(f"SEND FAILED -> {contact_id}: {e}", file=sys.stderr)
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--events", required=True)
@@ -187,11 +200,20 @@ def main():
         if a.dry:
             actions.append(f"#{no} {o['customer']}: WOULD SEND to chefs now")
         else:
-            for cid in CHEFS.values():
-                send_sms(cid, msg)
-            send_sms(DERRICK, cc)
-            send_sms(KEITA, cc)
-            actions.append(f"#{no} {o['customer']}: SENT to chefs ✅")
+            # Derrick's CC IS the dedup marker, so it goes FIRST. If it can't be written, send
+            # nothing this run (retry next hour) rather than text the chefs with no marker,
+            # which would re-text every chef every hour (e.g. if Derrick's contact is DND).
+            if not _try_send(DERRICK, cc):
+                actions.append(f"#{no} {o['customer']}: marker to Derrick FAILED, sent nothing, retry next hour")
+                continue
+            failed = [name for name, cid in CHEFS.items() if not _try_send(cid, msg)]
+            _try_send(KEITA, cc)
+            if failed:
+                _try_send(DERRICK, f"⚠️ Catering approval #{no} did NOT reach: {', '.join(failed)}. "
+                                   f"Please forward it to them.")
+                actions.append(f"#{no} {o['customer']}: SENT, but FAILED to {', '.join(failed)} ⚠️")
+            else:
+                actions.append(f"#{no} {o['customer']}: SENT to chefs ✅")
 
     # report
     print(f"Ran {now.strftime('%Y-%m-%d %H:%M HST')}. {len(events)} events, "
