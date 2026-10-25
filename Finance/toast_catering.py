@@ -19,6 +19,7 @@ import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -99,7 +100,7 @@ def collect(days):
     locations = [("PITCH", creds["TOAST_PITCH_GUID"]), ("Hinata", creds["TOAST_HINATA_GUID"])]
     token = get_token(creds, "TOAST_STD_CLIENT_ID", "TOAST_STD_CLIENT_SECRET")
 
-    today = datetime.now()
+    today = datetime.now(ZoneInfo("Pacific/Honolulu")).replace(tzinfo=None)  # HST, not machine clock (cloud runners are UTC)
     rows, errors = [], []
     for d in range(days + 1):
         bdate = (today + timedelta(days=d)).strftime("%Y%m%d")
