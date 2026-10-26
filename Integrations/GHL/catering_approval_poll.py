@@ -23,6 +23,12 @@ never blasted. Override with env GOLIVE_AFTER (ISO8601).
 
 Recipients (Derrick 2026-06-29): chefs = Darin + Jon Jon + Nixon on every order.
 
+CONFIRMED orders (paid online at checkout, or entered as Confirmed) get a one-time
+"📣 NEW CATERING ORDER ✅ CONFIRMED" announcement to the same people instead of an
+approval request (2026-10-25). Same dedup marker. Orders created before ANNOUNCE_AFTER
+are never announced, and more than MAX_ANNOUNCE_PER_RUN at once are held for Derrick
+(a Toast calendar re-sync re-creates old events).
+
 Usage:
   python3 catering_approval_poll.py --events events.json [--dry]
 """
@@ -33,6 +39,13 @@ from ghl_send_sms import send_sms, get_recent_messages
 
 HST = datetime.timezone(datetime.timedelta(hours=-10))
 GOLIVE_AFTER = os.environ.get("GOLIVE_AFTER", "2026-06-29T21:05:00-10:00")
+# Confirmed orders (paid online at checkout) used to be skipped entirely, so management
+# never got a text for them (Kellie Shiraishi #001675). They now get a one-time announcement.
+# Separate cutoff so the existing confirmed backlog is never blasted on go-live.
+ANNOUNCE_AFTER = os.environ.get("ANNOUNCE_AFTER", "2026-10-25T15:00:00-10:00")
+# More than this many brand-new confirmed orders in one run almost certainly means a Toast
+# calendar re-sync re-created old events (it did on 10/23). Hold them for Derrick instead.
+MAX_ANNOUNCE_PER_RUN = 3
 HEARTBEAT_HOUR = 8  # one liveness ping/day, at ~8am HST
 
 DERRICK = "a5VfxJQzMHa5SrdXXhcP"
@@ -66,7 +79,13 @@ def classify(items):
 
 def parse_event(ev):
     desc = ev.get("description", "") or ""
-    if CONFIRMED.search(desc) or LEAD.search(desc) or not TENTATIVE.search(desc):
+    if LEAD.search(desc):
+        return None
+    if CONFIRMED.search(desc):
+        status = "confirmed"
+    elif TENTATIVE.search(desc):
+        status = "tentative"
+    else:
         return None
     items = "\n".join(l.strip() for l in desc.splitlines()
                       if re.match(r"\s*\d+\s+\S", l) and "Guest count" not in l)
@@ -80,7 +99,7 @@ def parse_event(ev):
             "orderNo": om.group(1) if om else None, "customer": cust,
             "startDateTime": start.get("dateTime") or start.get("date"),
             "guests": gm.group(1) if gm else None, "itemsText": items,
-            "dept": classify(items)}
+            "dept": classify(items), "status": status}
 
 
 def _parse(ts):
@@ -138,6 +157,14 @@ def _try_send(contact_id, message):
         return False
 
 
+def announce_text(o, today):
+    day, ready = fmt_ready(o["startDateTime"])
+    u = " 🔴 URGENT" if is_urgent(event_date(o["startDateTime"]), today) else ""
+    return (f"📣 NEW CATERING ORDER ✅ CONFIRMED{u}\n{o['customer']} · {day} · ready {ready}\n"
+            f"→ {o['dept']}: {summary(o['itemsText'])}\n#{o['orderNo']} · {head_count(o)}\n"
+            f"Already confirmed, no approval needed. It's on the calendar. 🤙🏽")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--events", required=True)
@@ -149,16 +176,23 @@ def main():
     now = datetime.datetime.now(HST)
     today = now.date()
     golive = _parse(GOLIVE_AFTER)
+    announce_after = _parse(ANNOUNCE_AFTER)
 
-    # candidates = tentatives created AFTER go-live (backlog grandfathered)
+    # candidates = tentatives created after go-live, plus confirmed orders created after the
+    # announce cutoff that haven't happened yet (each backlog grandfathered by its cutoff)
     cands = []
     for ev in events:
         o = parse_event(ev)
         if not o or not o["orderNo"]:
             continue
         c = _parse(o["created"])
-        if c is None or (golive and c <= golive):
+        cutoff = announce_after if o["status"] == "confirmed" else golive
+        if c is None or (cutoff and c <= cutoff):
             continue
+        if o["status"] == "confirmed":
+            d = event_date(o["startDateTime"])
+            if d is None or d < today:
+                continue
         cands.append(o)
 
     # read Derrick's thread ONCE; derive state per order from it.
@@ -186,6 +220,21 @@ def main():
         return False
 
     actions = []
+    fresh_confirmed = [o for o in cands if o["status"] == "confirmed" and not has("CC (SENT", o["orderNo"])]
+    if len(fresh_confirmed) > MAX_ANNOUNCE_PER_RUN:
+        nos = " ".join(f"#{o['orderNo']}" for o in fresh_confirmed)
+        hold = (f"📋 CC (sent: bulk hold, NOT sent to chefs) {nos}\n"
+                f"{len(fresh_confirmed)} confirmed orders showed up at once, probably a Toast calendar "
+                f"re-sync of old orders. I did not text the chefs. Forward any that are actually new.")
+        if a.dry:
+            actions.append(f"WOULD HOLD {len(fresh_confirmed)} confirmed orders for Derrick: {nos}")
+        elif _try_send(DERRICK, hold):
+            actions.append(f"HELD {len(fresh_confirmed)} confirmed orders for Derrick (bulk guard): {nos}")
+        else:
+            actions.append(f"bulk-hold note to Derrick FAILED, sent nothing, retry next hour: {nos}")
+        held = {o["orderNo"] for o in fresh_confirmed}
+        cands = [o for o in cands if o["orderNo"] not in held]
+
     for o in cands:
         no = o["orderNo"]
         if has("CC (SENT", no):
@@ -194,11 +243,13 @@ def main():
         if has("HOLD", no, direction="inbound"):  # legacy holds from the old heads-up flow
             actions.append(f"#{no} {o['customer']}: HOLD by Derrick — held")
             continue
-        # first sighting -> straight to the chefs, CC Derrick + Keita (no heads-up wait)
-        msg = approval_text(o, today)
+        # first sighting -> straight to the chefs, CC Derrick + Keita (no heads-up wait).
+        # Confirmed orders get an announcement instead of an approval request.
+        msg = announce_text(o, today) if o["status"] == "confirmed" else approval_text(o, today)
+        kind = "announcement" if o["status"] == "confirmed" else "approval"
         cc = f"📋 CC (sent to Darin/Jon Jon/Nixon) #{no}\n" + msg
         if a.dry:
-            actions.append(f"#{no} {o['customer']}: WOULD SEND to chefs now")
+            actions.append(f"#{no} {o['customer']}: WOULD SEND {kind} to chefs now")
         else:
             # Derrick's CC IS the dedup marker, so it goes FIRST. If it can't be written, send
             # nothing this run (retry next hour) rather than text the chefs with no marker,
@@ -213,11 +264,12 @@ def main():
                                    f"Please forward it to them.")
                 actions.append(f"#{no} {o['customer']}: SENT, but FAILED to {', '.join(failed)} ⚠️")
             else:
-                actions.append(f"#{no} {o['customer']}: SENT to chefs ✅")
+                actions.append(f"#{no} {o['customer']}: SENT {kind} to chefs ✅")
 
     # report
     print(f"Ran {now.strftime('%Y-%m-%d %H:%M HST')}. {len(events)} events, "
-          f"{len(cands)} live candidate(s) (after cutoff {GOLIVE_AFTER}).")
+          f"{len(cands)} live candidate(s) (tentative after {GOLIVE_AFTER}, "
+          f"confirmed after {ANNOUNCE_AFTER}).")
     for line in actions:
         print("  " + line)
     if not actions:
