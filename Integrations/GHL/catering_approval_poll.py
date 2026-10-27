@@ -287,6 +287,16 @@ def thanksgiving_lane(tg, has, now, dry):
     return actions
 
 
+def _one_per_order(orders):
+    """One entry per order #, preferring a confirmed copy over a tentative one."""
+    by_no = {}
+    for o in orders:
+        kept = by_no.get(o["orderNo"])
+        if kept is None or (kept["status"] != "confirmed" and o["status"] == "confirmed"):
+            by_no[o["orderNo"]] = o
+    return list(by_no.values())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--events", required=True)
@@ -322,6 +332,11 @@ def main():
             if d is None or d < today:
                 continue
         cands.append(o)
+
+    # Toast sometimes writes the same order to the calendar twice in the same second (e.g. sent
+    # then confirmed right away, Shimomura #001689 on 10/27). The thread marker only dedups across
+    # runs, so collapse same-order copies here, keeping the confirmed one if they differ.
+    cands, tg = _one_per_order(cands), _one_per_order(tg)
 
     # read Derrick's thread ONCE; derive state per order from it.
     # 200, not 50: an order can sit for days between the heads-up and approval, and
