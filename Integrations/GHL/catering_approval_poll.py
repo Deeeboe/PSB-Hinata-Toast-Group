@@ -76,6 +76,16 @@ PHONE = re.compile(r"\(\d{3}\)\s*\d{3}-\d{4}")
 TENTATIVE = re.compile(r"Catering order status:\s*(Tentative|Estimate|Open|Inquiry)", re.I)
 CONFIRMED = re.compile(r"Catering order status:\s*Confirmed", re.I)
 LEAD = re.compile(r"Lead status:", re.I)
+# The inbox drafter routine rewrites an online order's calendar description into its own format
+# ("Order #001692 | Pickup | ..."), which drops Toast's "Catering order status" line. Orders it
+# reached before this poller were invisible here (Rachael Han #001692, 10/28). Drafter-format
+# events are always paid online orders.
+DRAFTER = re.compile(r"\A\s*Order #\d{4,}\s*\|")
+DRAFTER_CUST = re.compile(r"^Customer:\s*(.+)$", re.M)
+DRAFTER_ADDR = re.compile(r"^(?:Deliver to|Delivery address):\s*(.+)$", re.M | re.I)
+DELIVER_AT = re.compile(r"deliver at\s+([0-9:]+\s*[AP]M|TBD)", re.I)
+REPLACES = re.compile(r"REPLACES\s+Order\s+#(\d{4,})", re.I)
+CANCELLED = re.compile(r"^\s*CANCEL", re.I)
 ORDERNO = re.compile(r"#(\d{4,})")
 GUESTS = re.compile(r"Guest count:\s*(\d+)", re.I)
 # hand-roll fillings too: Toast lists them by filling ("Spicy Tuna", "Imi Crab Mayo", "Negi Hamachi"), so
@@ -102,26 +112,37 @@ def parse_event(ev):
     desc = ev.get("description", "") or ""
     if LEAD.search(desc):
         return None
-    if CONFIRMED.search(desc):
+    online = bool(DRAFTER.search(desc))
+    if online or CONFIRMED.search(desc):
         status = "confirmed"
     elif TENTATIVE.search(desc):
         status = "tentative"
     else:
         return None
-    items = "\n".join(l.strip() for l in desc.splitlines()
-                      if re.match(r"\s*\d+\s+\S", l) and "Guest count" not in l)
+    if online:  # items = the "Items:" block, "1x Edamame (1/2 Pan)" -> "1 Edamame (1/2 Pan)"
+        block = desc.split("Items:", 1)[1].split("\n\n", 1)[0] if "Items:" in desc else ""
+        items = "\n".join(re.sub(r"^(\d+)x\s+", r"\1 ", l.strip()) for l in block.splitlines()
+                          if re.match(r"\s*\d+x?\s+\S", l))
+    else:
+        items = "\n".join(l.strip() for l in desc.splitlines()
+                          if re.match(r"\s*\d+\s+\S", l) and "Guest count" not in l)
     start = ev.get("start", {})
     cust = ev.get("summary", "").strip()
-    m = re.search(r"Customer info:\s*\n([^\n]+)", desc)
+    m = re.search(r"Customer info:\s*\n([^\n]+)", desc) or (DRAFTER_CUST.search(desc) if online else None)
     if m:
         cust = m.group(1).strip()
+    kind = desc.split("|")[1].strip() if online and desc.count("|") >= 2 else ""
+    am, dm, rm = DRAFTER_ADDR.search(desc), DELIVER_AT.search(ev.get("summary", "")), REPLACES.search(desc)
     om, gm, pm = ORDERNO.search(desc), GUESTS.search(desc), PHONE.search(desc)
     return {"eventId": ev.get("id"), "created": ev.get("created"),
             "orderNo": om.group(1) if om else None, "customer": cust,
             "startDateTime": start.get("dateTime") or start.get("date"),
             "guests": gm.group(1) if gm else None, "itemsText": items,
             "dept": classify(items), "status": status,
-            "holiday": bool(HOLIDAY.search(desc)), "phone": pm.group(0) if pm else ""}
+            "holiday": bool(HOLIDAY.search(desc)), "phone": pm.group(0) if pm else "",
+            "online": online, "kind": kind, "address": am.group(1).strip() if am else "",
+            "deliverAt": dm.group(1).strip() if dm else "", "replaces": rm.group(1) if rm else None,
+            "cancelled": bool(CANCELLED.search(ev.get("summary", "")))}
 
 
 def _parse(ts):
@@ -185,6 +206,24 @@ def announce_text(o, today):
     return (f"📣 NEW CATERING ORDER ✅ CONFIRMED{u}\n{o['customer']} · {day} · ready {ready}\n"
             f"→ {o['dept']}: {summary(o['itemsText'])}\n#{o['orderNo']} · {head_count(o)}\n"
             f"Already confirmed, no approval needed. It's on the calendar. 🤙🏽")
+
+
+def online_text(o):
+    """Same layout as the manual announce in Catering-Orders/toast-order-processor-SKILL.md step 10."""
+    dt = _parse(o["startDateTime"])
+    day = dt.astimezone(HST).strftime("%a %-m/%-d") if dt else "TBD"
+    ready = dt.astimezone(HST).strftime("%-I:%M %p") if dt else "TBD"
+    if o["kind"].lower().startswith("deliver"):
+        how = f"Delivery to {o['address'] or 'address on BEO'} at {o['deliverAt'] or 'TBD'}"
+    else:
+        how = o["kind"] or "Pickup"
+    rep = (f"⚠️ REPLACES #{o['replaces']}. #{o['replaces']} is CANCELLED, do not make it. "
+           f"Toss the #{o['replaces']} BEO.\n") if o["replaces"] else ""
+    items = "\n".join(re.sub(r"\(1/2 Pan\)", "(1/2 pan)", l) for l in o["itemsText"].splitlines())
+    guests = f"Guest count: {o['guests']}\n" if o.get("guests") and o["guests"] != "1" else ""
+    return (f"🍱 NEW ONLINE CATERING ORDER (placed + paid online by the customer)\n"
+            f"{o['customer']} · #{o['orderNo']} · {day}\n{rep}Ready by {ready}  ·  {how}\n"
+            f"{items}\n{guests}Dept: {o['dept']}. BEO sent to the bar printer, no reply needed.")
 
 
 def _start(o):
@@ -317,7 +356,7 @@ def main():
     cands, tg = [], []
     for ev in events:
         o = parse_event(ev)
-        if not o or not o["orderNo"]:
+        if not o or not o["orderNo"] or o["cancelled"]:
             continue
         if o["holiday"]:  # holiday menus never go to the chefs; Thanksgiving gets its own lane
             if event_date(o["startDateTime"]) == TG_DATE:
@@ -353,6 +392,10 @@ def main():
               "Sending NOTHING this run so already-approved orders are not re-blasted. "
               "Will retry next hour.")
         return
+    def sent(no):
+        # poller marker, or a manual announce (local order-processor skill step 10) CC'd to Derrick
+        return has("CC (SENT", no) or has("NEW ONLINE CATERING ORDER", f"#{no}", direction="outbound")
+
     def has(*subs, direction=None):
         for m in derrick_msgs:
             if direction and m["direction"] != direction:
@@ -363,7 +406,7 @@ def main():
         return False
 
     actions = []
-    fresh_confirmed = [o for o in cands if o["status"] == "confirmed" and not has("CC (SENT", o["orderNo"])]
+    fresh_confirmed = [o for o in cands if o["status"] == "confirmed" and not sent(o["orderNo"])]
     if len(fresh_confirmed) > MAX_ANNOUNCE_PER_RUN:
         nos = " ".join(f"#{o['orderNo']}" for o in fresh_confirmed)
         hold = (f"📋 CC (sent: bulk hold, NOT sent to chefs) {nos}\n"
@@ -380,7 +423,7 @@ def main():
 
     for o in cands:
         no = o["orderNo"]
-        if has("CC (SENT", no):
+        if sent(no):
             actions.append(f"#{no} {o['customer']}: already sent to chefs — skip")
             continue
         if has("HOLD", no, direction="inbound"):  # legacy holds from the old heads-up flow
@@ -388,7 +431,10 @@ def main():
             continue
         # first sighting -> straight to the chefs, CC Derrick + Keita (no heads-up wait).
         # Confirmed orders get an announcement instead of an approval request.
-        msg = announce_text(o, today) if o["status"] == "confirmed" else approval_text(o, today)
+        if o["status"] != "confirmed":
+            msg = approval_text(o, today)
+        else:
+            msg = online_text(o) if o["online"] else announce_text(o, today)
         kind = "announcement" if o["status"] == "confirmed" else "approval"
         cc = f"📋 CC (sent to Darin/Jon Jon/Nixon) #{no}\n" + msg
         if a.dry:
