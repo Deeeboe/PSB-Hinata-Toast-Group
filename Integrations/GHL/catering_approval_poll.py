@@ -79,8 +79,10 @@ LEAD = re.compile(r"Lead status:", re.I)
 # The inbox drafter routine rewrites an online order's calendar description into its own format
 # ("Order #001692 | Pickup | ..."), which drops Toast's "Catering order status" line. Orders it
 # reached before this poller were invisible here (Rachael Han #001692, 10/28). Drafter-format
-# events are always paid online orders.
-DRAFTER = re.compile(r"\A\s*Order #\d{4,}\s*\|")
+# events are always paid online orders. The drafter puts either " | " or a line break after the
+# order # ("Order #001703\nPickup | ..."); the pipe-only pattern missed Josiah Morita #001703, 10/29.
+DRAFTER = re.compile(r"\A\s*Order #\d{4,}\s*(?:\||\n\s*(?:Pickup|Deliver|Take))", re.I)
+DRAFTER_KIND = re.compile(r"\A\s*Order #\d{4,}\s*[|\n]\s*([^|\n]+?)\s*\|")
 DRAFTER_CUST = re.compile(r"^Customer:\s*(.+)$", re.M)
 DRAFTER_ADDR = re.compile(r"^(?:Deliver to|Delivery address):\s*(.+)$", re.M | re.I)
 DELIVER_AT = re.compile(r"deliver at\s+([0-9:]+\s*[AP]M|TBD)", re.I)
@@ -131,7 +133,8 @@ def parse_event(ev):
     m = re.search(r"Customer info:\s*\n([^\n]+)", desc) or (DRAFTER_CUST.search(desc) if online else None)
     if m:
         cust = m.group(1).strip()
-    kind = desc.split("|")[1].strip() if online and desc.count("|") >= 2 else ""
+    km = DRAFTER_KIND.search(desc) if online else None
+    kind = km.group(1) if km else ""
     am, dm, rm = DRAFTER_ADDR.search(desc), DELIVER_AT.search(ev.get("summary", "")), REPLACES.search(desc)
     om, gm, pm = ORDERNO.search(desc), GUESTS.search(desc), PHONE.search(desc)
     return {"eventId": ev.get("id"), "created": ev.get("created"),
