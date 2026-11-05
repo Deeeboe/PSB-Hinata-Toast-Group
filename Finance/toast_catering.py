@@ -2,7 +2,8 @@
 """Combined upcoming catering — PITCH + Hinata — from the Toast Orders API.
 
 Pulls catering orders (source "Catering" = invoiced, "Catering Online Ordering" =
-website orders) across BOTH restaurant GUIDs for the next N days
+website orders, "Invoice" = staff-built invoices; a rebuilt order often lands here)
+across BOTH restaurant GUIDs for the next N days
 (by event/business date), merges them, and prints one clean chronological list.
 
 Usage:
@@ -11,6 +12,10 @@ Usage:
     python3 Finance/toast_catering.py 7 --json   # next 7 days, machine-readable
 
 Reads creds from .vault/toast.env via toast_client (Standard "demo webhook" cred).
+Voided/deleted orders are NOT jobs: they are left out of the list and totals and
+printed in a separate "Voided / canceled" section (JSON: "voided") so a cancel is
+still visible (2026-11-05: Meheula + Huang voided orders showed up as live jobs).
+
 Stdlib-only. Respects Toast's token cache + rate limits.
 """
 import sys
@@ -25,7 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from toast_client import load_env, get_token
 
-CATERING_SOURCES = ("catering", "catering online ordering")  # invoiced + website orders
+CATERING_SOURCES = ("catering", "catering online ordering", "invoice")  # invoiced + website + staff invoices
 HST_OFFSET = timedelta(hours=10)  # Hawaii Standard Time = UTC-10, no DST
 
 
@@ -61,6 +66,14 @@ def fetch_day(host, token, guid, bdate):
         page += 1
         time.sleep(0.25)              # stay well under 5 req/sec/location
     return out
+
+
+def is_voided(o):
+    """True if Toast voided/deleted the order, or every check on it."""
+    if o.get("voided") or o.get("deleted"):
+        return True
+    checks = o.get("checks") or []
+    return bool(checks) and all(c.get("voided") or c.get("deleted") for c in checks)
 
 
 def order_row(o, restaurant):
@@ -101,18 +114,19 @@ def collect(days):
     token = get_token(creds, "TOAST_STD_CLIENT_ID", "TOAST_STD_CLIENT_SECRET")
 
     today = datetime.now(ZoneInfo("Pacific/Honolulu")).replace(tzinfo=None)  # HST, not machine clock (cloud runners are UTC)
-    rows, errors = [], []
+    rows, voided, errors = [], [], []
     for d in range(days + 1):
         bdate = (today + timedelta(days=d)).strftime("%Y%m%d")
         for name, guid in locations:
             try:
                 for o in fetch_day(host, token, guid, bdate):
                     if str(o.get("source", "")).lower() in CATERING_SOURCES:
-                        rows.append(order_row(o, name))
+                        (voided if is_voided(o) else rows).append(order_row(o, name))
             except RuntimeError as e:
                 errors.append(f"{name} {bdate}: {e}")
     rows.sort(key=lambda r: r["when"] or "")
-    return today, rows, errors
+    voided.sort(key=lambda r: r["when"] or "")
+    return today, rows, voided, errors
 
 
 def main():
@@ -121,10 +135,11 @@ def main():
     nums = [a for a in args if a.isdigit()]
     days = int(nums[0]) if nums else 14
 
-    today, rows, errors = collect(days)
+    today, rows, voided, errors = collect(days)
 
     if as_json:
-        print(json.dumps({"generated": today.isoformat(), "days": days, "orders": rows}, indent=2))
+        print(json.dumps({"generated": today.isoformat(), "days": days, "orders": rows,
+                          "voided": voided}, indent=2))
         return
 
     end = today + timedelta(days=days)
@@ -136,7 +151,6 @@ def main():
         print()
     if not rows:
         print("  (no catering orders found in this window)")
-        return
     for r in rows:
         print(f"  {fmt_local(r['when']):<17} [{r['restaurant']:<6}] #{r['number'] or '—':<7} "
               f"{r['customer'][:24]:<24} ${r['amount']:,.2f}"
@@ -145,6 +159,11 @@ def main():
             print(f"       {', '.join(r['items'][:8])}")
     total = sum(r["amount"] for r in rows)
     print(f"\n  {len(rows)} catering orders · ${total:,.2f} total")
+    if voided:
+        print("\n  Voided / canceled in Toast (NOT happening, double-check if unexpected):")
+        for r in voided:
+            print(f"    {fmt_local(r['when']):<17} [{r['restaurant']:<6}] #{r['number'] or '—':<7} "
+                  f"{r['customer'][:24]}")
 
 
 if __name__ == "__main__":
