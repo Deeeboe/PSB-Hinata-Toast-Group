@@ -1,0 +1,87 @@
+name: Dropbox Media to Google Drive
+
+# Copies Keita's Dropbox "FSMB LLC dba Pitch Sports Bar/Media" folder into the
+# PITCH Google Workspace shared drive "Dropbox (Keita)" (folder: Media).
+# COPY, not sync: deleting something in Dropbox never deletes it from Drive,
+# and nothing is ever written to Dropbox. Setup + revoke steps:
+# Integrations/Dropbox-Drive-Sync/README.md in the main PITCH repo.
+#
+# Secrets:
+#   DROPBOX_RCLONE_TOKEN  rclone Dropbox token JSON (Keita approved 11/8/2026)
+#   GDRIVE_SA_JSON        service account key for
+#                         pitch-dropbox-sync@pitch-media-sync.iam.gserviceaccount.com
+#                         (Content manager on that one shared drive only)
+
+on:
+  schedule:
+    - cron: "23 */4 * * *"   # every 4 hours, at :23 past
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write   # keepalive only (GitHub disables schedules after 60 quiet days)
+
+concurrency:
+  group: dropbox-media-sync
+  cancel-in-progress: false
+
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Install rclone v1.76.0 (checksum verified)
+        run: |
+          set -euo pipefail
+          V=v1.76.0
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://downloads.rclone.org/$V/rclone-$V-linux-amd64.zip"
+          curl -fsSL "https://downloads.rclone.org/$V/SHA256SUMS" -o SHA256SUMS
+          grep " rclone-$V-linux-amd64.zip\$" SHA256SUMS | sha256sum -c -
+          unzip -q "rclone-$V-linux-amd64.zip"
+          sudo install "rclone-$V-linux-amd64/rclone" /usr/local/bin/rclone
+          rclone version | head -1
+
+      - name: Write rclone config from secrets
+        env:
+          DROPBOX_RCLONE_TOKEN: ${{ secrets.DROPBOX_RCLONE_TOKEN }}
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$DROPBOX_RCLONE_TOKEN" || { echo "Missing DROPBOX_RCLONE_TOKEN secret"; exit 1; }
+          test -n "$GDRIVE_SA_JSON" || { echo "Missing GDRIVE_SA_JSON secret"; exit 1; }
+          printf '%s' "$GDRIVE_SA_JSON" > "$RUNNER_TEMP/sa.json"
+          {
+            echo "[pitchdropbox]"
+            echo "type = dropbox"
+            echo "token = $DROPBOX_RCLONE_TOKEN"
+            echo
+            echo "[pitchshared]"
+            echo "type = drive"
+            echo "scope = drive"
+            echo "service_account_file = $RUNNER_TEMP/sa.json"
+            echo "team_drive = 0AJv2BNlNSt5NUk9PVA"
+          } > "$RUNNER_TEMP/rclone.conf"
+
+      - name: Copy Media (Dropbox -> shared drive)
+        env:
+          RCLONE_CONFIG: ${{ runner.temp }}/rclone.conf
+        run: |
+          set -euo pipefail
+          rclone copy "pitchdropbox:FSMB LLC dba Pitch Sports Bar/Media" "pitchshared:Media" \
+            --transfers 4 --checkers 8 \
+            --drive-stop-on-upload-limit \
+            --stats 2m --stats-one-line --log-level INFO
+          echo "--- destination totals"
+          rclone size "pitchshared:Media"
+
+      - name: Clean up secrets on runner
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sa.json" "$RUNNER_TEMP/rclone.conf"
+
+      - name: Keepalive (stop GitHub's 60-day inactivity auto-disable)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/dropbox-media-sync.yml/enable" && echo "keepalive OK"
