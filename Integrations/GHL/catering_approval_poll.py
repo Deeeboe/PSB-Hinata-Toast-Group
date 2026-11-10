@@ -125,8 +125,10 @@ def parse_event(ev):
         block = desc.split("Items:", 1)[1].split("\n\n", 1)[0] if "Items:" in desc else ""
         items = "\n".join(re.sub(r"^(\d+)x\s+", r"\1 ", l.strip()) for l in block.splitlines()
                           if re.match(r"\s*\d+x?\s+\S", l))
-    else:
-        items = "\n".join(l.strip() for l in desc.splitlines()
+    else:  # skip the "Customer info:" block so a street address ("401 Kamakee Street",
+        # Matt Choy #001754, 11/10) is never counted as 401 of an item
+        body = re.sub(r"Customer info:.*?(?=\n-{5,}|\Z)", "", desc, flags=re.S)
+        items = "\n".join(l.strip() for l in body.splitlines()
                           if re.match(r"\s*\d+\s+\S", l) and "Guest count" not in l)
     start = ev.get("start", {})
     cust = ev.get("summary", "").strip()
