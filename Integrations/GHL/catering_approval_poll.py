@@ -87,6 +87,13 @@ DRAFTER_CUST = re.compile(r"^Customer:\s*(.+)$", re.M)
 DRAFTER_ADDR = re.compile(r"^(?:Deliver to|Delivery address):\s*(.+)$", re.M | re.I)
 DELIVER_AT = re.compile(r"deliver at\s+([0-9:]+\s*[AP]M|TBD)", re.I)
 REPLACES = re.compile(r"REPLACES\s+Order\s+#(\d{4,})", re.I)
+# Paid online order still in TOAST's calendar format (Toast writes the event before the hourly
+# drafter rewrites it, so the poller often sees it first: Saya Brown #001760, 11/10). Online
+# checkout is paid up front and never gets an invoice, so: a CONFIRMED order whose first line is a
+# PITCH menu ("Pitch catering", "Pitch bento sets") with NO "Invoice #" = placed + paid online.
+# Hinata staff-entered orders ("Hinata ...", e.g. #001496) and invoiced orders are excluded.
+TOAST_ONLINE_FIRST = re.compile(r"\A\s*Pitch\b[^\n]*#\d{4,}", re.I)
+INVOICE_LINE = re.compile(r"Invoice #\d", re.I)
 CANCELLED = re.compile(r"^\s*CANCEL", re.I)
 ORDERNO = re.compile(r"#(\d{4,})")
 GUESTS = re.compile(r"Guest count:\s*(\d+)", re.I)
@@ -145,7 +152,10 @@ def parse_event(ev):
             "guests": gm.group(1) if gm else None, "itemsText": items,
             "dept": classify(items), "status": status,
             "holiday": bool(HOLIDAY.search(desc)), "phone": pm.group(0) if pm else "",
-            "online": online, "kind": kind, "address": am.group(1).strip() if am else "",
+            "online": online,
+            "paid_online": online or (status == "confirmed" and bool(TOAST_ONLINE_FIRST.search(desc))
+                                      and not INVOICE_LINE.search(desc)),
+            "kind": kind, "address": am.group(1).strip() if am else "",
             "deliverAt": dm.group(1).strip() if dm else "", "replaces": rm.group(1) if rm else None,
             "cancelled": bool(CANCELLED.search(ev.get("summary", "")))}
 
@@ -221,14 +231,14 @@ def online_text(o):
     if o["kind"].lower().startswith("deliver"):
         how = f"Delivery to {o['address'] or 'address on BEO'} at {o['deliverAt'] or 'TBD'}"
     else:
-        how = o["kind"] or "Pickup"
+        how = o["kind"] or "Pickup or delivery: see BEO"
     rep = (f"⚠️ REPLACES #{o['replaces']}. #{o['replaces']} is CANCELLED, do not make it. "
            f"Toss the #{o['replaces']} BEO.\n") if o["replaces"] else ""
     items = "\n".join(re.sub(r"\(1/2 Pan\)", "(1/2 pan)", l) for l in o["itemsText"].splitlines())
     guests = f"Guest count: {o['guests']}\n" if o.get("guests") and o["guests"] != "1" else ""
     return (f"🍱 NEW ONLINE CATERING ORDER (placed + paid online by the customer)\n"
             f"{o['customer']} · #{o['orderNo']} · {day}\n{rep}Ready by {ready}  ·  {how}\n"
-            f"{items}\n{guests}Dept: {o['dept']}. BEO sent to the bar printer, no reply needed.")
+            f"{items}\n{guests}Dept: {o['dept']}. Already paid, no approval needed. BEO prints at the bar within the hour.")
 
 
 def _start(o):
@@ -341,15 +351,49 @@ def _one_per_order(orders):
     return list(by_no.values())
 
 
+def load_online_orders(path):
+    """Toast emails a 'Catering order #N received ... new Catering online order ... Type Pickup'
+    message ONLY for orders placed + paid online, so that email is the ground truth (Derrick 11/10).
+    The cloud routine reads info@ Gmail and writes {"ok": true, "orders": {"001760": "Pickup"}}.
+    Returns (dict or None, log line). None = unknown, so the calendar rule decides."""
+    if not path:
+        return None, "online-order email check: not provided, using the calendar rule only"
+    try:
+        d = json.load(open(path))
+    except (OSError, ValueError) as e:
+        return None, f"online-order email check: UNREADABLE ({e}), using the calendar rule only"
+    if not d.get("ok"):
+        return None, f"online-order email check: FAILED ({d.get('error', 'no reason given')}), using the calendar rule only"
+    orders = {str(k).lstrip("#").zfill(6): (v or "") for k, v in (d.get("orders") or {}).items()}
+    return orders, f"online-order email check: OK, {len(orders)} Toast online-order email(s) found"
+
+
+def apply_online_email(o, online_email):
+    """Email proof wins. Without proof for this order, keep the calendar rule from parse_event."""
+    if not online_email or not o.get("orderNo"):
+        return
+    kind = online_email.get(o["orderNo"].zfill(6))
+    if kind is not None:
+        o["paid_online"] = True
+        o["online_proof"] = "toast email"
+        if not o.get("kind") and kind:
+            o["kind"] = kind
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--events", required=True)
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--now", help="pretend it's this HST time (ISO8601), for testing the dated sends")
+    ap.add_argument("--online-orders", help="JSON from the routine's Gmail check: {\"ok\": true, \"orders\": "
+                    "{\"001760\": \"Pickup\"}} = Toast 'Catering order #N received' emails (online + paid). "
+                    "Missing/ok=false -> fall back to the calendar rule.")
     a = ap.parse_args()
 
     raw = json.load(open(a.events))
     events = raw.get("events", raw) if isinstance(raw, dict) else raw
+    online_email, email_note = load_online_orders(a.online_orders)
+    print(email_note)
     now = (datetime.datetime.fromisoformat(a.now).replace(tzinfo=HST) if a.now
            else datetime.datetime.now(HST))
     today = now.date()
@@ -363,6 +407,7 @@ def main():
         o = parse_event(ev)
         if not o or not o["orderNo"] or o["cancelled"]:
             continue
+        apply_online_email(o, online_email)
         if o["holiday"]:  # holiday menus never go to the chefs; Thanksgiving gets its own lane
             if event_date(o["startDateTime"]) == TG_DATE:
                 tg.append(o)
@@ -439,7 +484,7 @@ def main():
         if o["status"] != "confirmed":
             msg = approval_text(o, today)
         else:
-            msg = online_text(o) if o["online"] else announce_text(o, today)
+            msg = online_text(o) if o["paid_online"] else announce_text(o, today)
         kind = "announcement" if o["status"] == "confirmed" else "approval"
         cc = f"📋 CC (sent to Darin/Jon Jon/Nixon) #{no}\n" + msg
         if a.dry:
