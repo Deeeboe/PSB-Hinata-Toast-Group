@@ -1,0 +1,105 @@
+name: Hinata Dropbox Media to Google Drive
+
+# Copies Hinata's media folders from Keita's Dropbox into the Hinata Google
+# Workspace (info@hinatahawaii.com) shared drive "Dropbox (Keita)".
+# COPY, not sync: deleting something in Dropbox never deletes it from Drive,
+# and nothing is ever written to Dropbox. Only the media folders below are
+# copied; Financials, Payroll, Invoices, Lease Docs and Company Docs never are.
+# Setup + revoke steps: Integrations/Dropbox-Drive-Sync/README.md in the
+# Hinata project folder.
+#
+# Secrets:
+#   DROPBOX_RCLONE_TOKEN   same rclone Dropbox token the PITCH job uses
+#                          (Keita's Dropbox, approved 11/8/2026)
+#   GDRIVE_SA_JSON_HINATA  service account key for
+#                          hinata-dropbox-sync@hinata-media-sync.iam.gserviceaccount.com
+#                          (Content manager on the Hinata shared drive only)
+
+on:
+  schedule:
+    - cron: "53 */4 * * *"   # every 4 hours, at :53 past (PITCH runs at :23)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write   # keepalive only (GitHub disables schedules after 60 quiet days)
+
+concurrency:
+  group: hinata-dropbox-media-sync
+  cancel-in-progress: false
+
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Install rclone v1.76.0 (checksum verified)
+        run: |
+          set -euo pipefail
+          V=v1.76.0
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://downloads.rclone.org/$V/rclone-$V-linux-amd64.zip"
+          curl -fsSL "https://downloads.rclone.org/$V/SHA256SUMS" -o SHA256SUMS
+          grep " rclone-$V-linux-amd64.zip\$" SHA256SUMS | sha256sum -c -
+          unzip -q "rclone-$V-linux-amd64.zip"
+          sudo install "rclone-$V-linux-amd64/rclone" /usr/local/bin/rclone
+          rclone version | head -1
+
+      - name: Write rclone config from secrets
+        env:
+          DROPBOX_RCLONE_TOKEN: ${{ secrets.DROPBOX_RCLONE_TOKEN }}
+          GDRIVE_SA_JSON_HINATA: ${{ secrets.GDRIVE_SA_JSON_HINATA }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$DROPBOX_RCLONE_TOKEN" || { echo "Missing DROPBOX_RCLONE_TOKEN secret"; exit 1; }
+          test -n "$GDRIVE_SA_JSON_HINATA" || { echo "Missing GDRIVE_SA_JSON_HINATA secret"; exit 1; }
+          printf '%s' "$GDRIVE_SA_JSON_HINATA" > "$RUNNER_TEMP/sa.json"
+          {
+            echo "[keitadropbox]"
+            echo "type = dropbox"
+            echo "token = $DROPBOX_RCLONE_TOKEN"
+            echo
+            echo "[hinatashared]"
+            echo "type = drive"
+            echo "scope = drive"
+            echo "service_account_file = $RUNNER_TEMP/sa.json"
+            echo "team_drive = 0AArhmajLMHkLUk9PVA"
+          } > "$RUNNER_TEMP/rclone.conf"
+
+      - name: Copy media folders (Dropbox -> shared drive)
+        env:
+          RCLONE_CONFIG: ${{ runner.temp }}/rclone.conf
+        run: |
+          set -euo pipefail
+          H="Hinata LLC dba Hinata Mobile Sushi & Catering"
+          # "Dropbox path|Drive folder"
+          while IFS='|' read -r src dst; do
+            [ -n "$src" ] || continue
+            echo "=== $src -> $dst"
+            rclone copy "keitadropbox:$src" "hinatashared:$dst" \
+              --transfers 4 --checkers 8 \
+              --drive-stop-on-upload-limit \
+              --stats 2m --stats-one-line --log-level INFO
+          done <<EOF
+          $H/Media|Media
+          $H/Logo|Logo
+          $H/Marketing Material|Marketing Material
+          $H/Website|Website
+          $H/Menus|Menus
+          $H/Event Menus|Event Menus
+          HINATA FLYERS|HINATA FLYERS
+          LIFESTYLE AND VENUE|LIFESTYLE AND VENUE
+          EOF
+          echo "--- destination totals"
+          rclone size "hinatashared:"
+
+      - name: Clean up secrets on runner
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sa.json" "$RUNNER_TEMP/rclone.conf"
+
+      - name: Keepalive (stop GitHub's 60-day inactivity auto-disable)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/hinata-dropbox-media-sync.yml/enable" && echo "keepalive OK"
