@@ -318,7 +318,10 @@ def tg_tally(orders):
         for line in o["itemsText"].splitlines():
             m = re.match(r"\s*(\d+)\s+(.+)", line)
             if m:
-                items[m.group(2).strip()] = items.get(m.group(2).strip(), 0) + int(m.group(1))
+                # Hinata's copy of the menu says "Pitch Thanksgiving Dinner" (PITCH orders are
+                # sometimes rung in under Hinata, Derrick 11/16): count both as one item
+                name = re.sub(r"^pitch\b", "PITCH", m.group(2).strip(), flags=re.I)
+                items[name] = items.get(name, 0) + int(m.group(1))
         t = fmt_ready(o["startDateTime"])[1]
         slots[t] = slots.get(t, 0) + 1
     item_lines = "\n".join(f"{q} {n}" for n, q in sorted(items.items(), key=lambda kv: (-kv[1], kv[0])))
