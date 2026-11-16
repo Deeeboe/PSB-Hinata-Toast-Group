@@ -29,6 +29,11 @@ approval request (2026-10-25). Same dedup marker. Orders created before ANNOUNCE
 are never announced, and more than MAX_ANNOUNCE_PER_RUN at once are held for Derrick
 (a Toast calendar re-sync re-creates old events).
 
+TENTATIVE = STAFF-ENTERED (Derrick 2026-11-16): staff only ring in orders the chefs already OK'd,
+so the chefs get an FYI ("NEW CATERING ORDER ... no reply needed"), not a "Reply YES" request.
+Derrick + Keita's CC adds a one-tap Toast link to set it Confirmed (Toast no longer does it on
+its own), and each morning at 9 they get the orders in the next 7 days still Tentative.
+
 THANKSGIVING (Derrick 2026-10-26): "Holiday special menus" orders NEVER go to the chef
 lane. Instead:
   - each new Thanksgiving order -> management (Derrick, Keita, Adam, Zenn, Alisa) with the
@@ -111,6 +116,13 @@ REPLACES = re.compile(r"REPLACES\s+Order\s+#(\d{4,})", re.I)
 TOAST_ONLINE_FIRST = re.compile(r"\A\s*Pitch\b[^\n]*#\d{4,}", re.I)
 INVOICE_LINE = re.compile(r"Invoice #\d", re.I)
 CANCELLED = re.compile(r"^\s*CANCEL", re.I)
+# Toast writes the order's own page link into the calendar description ("Order: https://...").
+ORDER_LINK = re.compile(r"Order:\s*(https://www\.toasttab\.com/restaurants/admin/invoices/events/[0-9a-f-]+)", re.I)
+# Each morning Keita + Derrick get the orders in the next STILL_TENTATIVE_DAYS that are still
+# Tentative in Toast, with one-tap links (Derrick 11/16: staff only ring in orders the chefs
+# already OK'd, but Toast no longer flips them to Confirmed on its own).
+STILL_TENTATIVE_DAYS = 7
+STILL_TENTATIVE_HOUR = 9
 ORDERNO = re.compile(r"#(\d{4,})")
 GUESTS = re.compile(r"Guest count:\s*(\d+)", re.I)
 # hand-roll fillings too: Toast lists them by filling ("Spicy Tuna", "Imi Crab Mayo", "Negi Hamachi"), so
@@ -163,6 +175,7 @@ def parse_event(ev):
     kind = km.group(1) if km else ""
     am, dm, rm = DRAFTER_ADDR.search(desc), DELIVER_AT.search(ev.get("summary", "")), REPLACES.search(desc)
     om, gm, pm = ORDERNO.search(desc), GUESTS.search(desc), PHONE.search(desc)
+    lm = ORDER_LINK.search(desc)
     return {"eventId": ev.get("id"), "created": ev.get("created"),
             "orderNo": om.group(1) if om else None, "customer": cust,
             "startDateTime": start.get("dateTime") or start.get("date"),
@@ -170,7 +183,8 @@ def parse_event(ev):
             "dept": classify(items), "status": status,
             "holiday": bool(HOLIDAY.search(desc) or HOLIDAY_ITEMS.search(items)),
             "phone": pm.group(0) if pm else "",
-            "online": online,
+            "online": online, "link": lm.group(1) if lm else "",
+            "hinata": bool(re.match(r"\s*Hinata", desc, re.I)),
             "paid_online": online or (status == "confirmed" and bool(TOAST_ONLINE_FIRST.search(desc))
                                       and not INVOICE_LINE.search(desc)),
             "kind": kind, "address": am.group(1).strip() if am else "",
@@ -216,11 +230,42 @@ def head_count(o):
 
 
 def approval_text(o, today):
+    """Staff-entered (Tentative) order -> FYI to the chefs. No reply asked (Derrick 11/16: staff
+    only ring in orders the chefs already agreed to, and nobody in the kitchen replied anyway)."""
     day, ready = fmt_ready(o["startDateTime"])
     u = " 🔴 URGENT" if is_urgent(event_date(o["startDateTime"]), today) else ""
-    return (f"🍽️ CATERING APPROVAL{u}\n{o['customer']} · {day} · ready {ready}\n"
+    return (f"🍽️ NEW CATERING ORDER{u}\n{o['customer']} · {day} · ready {ready}\n"
             f"→ {o['dept']}: {summary(o['itemsText'])}\n#{o['orderNo']} · {head_count(o)}\n"
-            f"Reply YES {o['orderNo']} to approve, or flag any issue. 🤙🏽")
+            f"Rung in by staff, already OK'd with the kitchen. It's on the calendar, no reply needed. 🤙🏽")
+
+
+def confirm_line(o):
+    """For Derrick + Keita only: Toast leaves staff-entered orders Tentative, so link straight to it."""
+    if not o.get("link"):
+        return "\n\n⏳ Still TENTATIVE in Toast. Set it to Confirmed (order link not on the calendar event)."
+    return (f"\n\n⏳ Still TENTATIVE in Toast. Tap, then set the status at the top to Confirmed:\n{o['link']}"
+            f"\n(Who rang it in: Discussion & history tab.)")
+
+
+def still_tentative_texts(orders, today, limit=1200):
+    """Morning list of orders in the next STILL_TENTATIVE_DAYS still Tentative in Toast."""
+    rows = []
+    for o in sorted(orders, key=_start):
+        day, ready = fmt_ready(o["startDateTime"])
+        tag = " [Hinata]" if o.get("hinata") else ""
+        rows.append(f"{day} {ready} {o['customer']} #{o['orderNo']}{tag}\n{o['link'] or '(no link on calendar)'}")
+    chunks, cur = [], ""
+    for r in rows:
+        if cur and len(cur) + len(r) > limit:
+            chunks.append(cur)
+            cur = ""
+        cur += r + "\n\n"
+    chunks.append(cur)
+    n = len(chunks)
+    head = f"⏳ STILL TENTATIVE {today.strftime('%-m/%-d')}"
+    return [f"{head}{f' ({i}/{n})' if n > 1 else ''} · {len(orders)} order{'s' if len(orders) != 1 else ''} in the "
+            f"next {STILL_TENTATIVE_DAYS} days not Confirmed in Toast. Tap each, set the status at the top to "
+            f"Confirmed:\n\n{c.rstrip()}" for i, c in enumerate(chunks, 1)]
 
 
 def _try_send(contact_id, message):
@@ -454,12 +499,15 @@ def main():
 
     # candidates = tentatives created after go-live, plus confirmed orders created after the
     # announce cutoff that haven't happened yet (each backlog grandfathered by its cutoff)
-    cands, tg = [], []
+    cands, tg, tentative_soon = [], [], []
     for ev in events:
         o = parse_event(ev)
         if not o or not o["orderNo"] or o["cancelled"]:
             continue
         apply_online_email(o, online_email)
+        d = event_date(o["startDateTime"])
+        if o["status"] == "tentative" and d and 0 <= (d - today).days <= STILL_TENTATIVE_DAYS:
+            tentative_soon.append(o)
         if o["holiday"]:  # holiday menus never go to the chefs; Thanksgiving gets its own lane
             if event_date(o["startDateTime"]) == TG_DATE:
                 tg.append(o)
@@ -545,8 +593,10 @@ def main():
             msg = approval_text(o, today)
         else:
             msg = online_text(o) if o["paid_online"] else announce_text(o, today)
-        kind = "announcement" if o["status"] == "confirmed" else "approval"
+        kind = "announcement" if o["status"] == "confirmed" else "new-order FYI"
         cc = f"📋 CC (sent to Darin/Jon Jon/Nixon) #{no}\n" + msg
+        if o["status"] != "confirmed":
+            cc += confirm_line(o)
         if a.dry:
             actions.append(f"#{no} {o['customer']}: WOULD SEND {kind} to chefs now")
         else:
@@ -566,6 +616,23 @@ def main():
                 actions.append(f"#{no} {o['customer']}: SENT {kind} to chefs ✅")
 
     actions += thanksgiving_lane(tg, has, now, a.dry)
+
+    # morning "still tentative" list to Derrick (first: his copy is the marker) + Keita
+    tentative_soon = _one_per_order(tentative_soon)
+    # once per day: if any part of today's list went out, don't send again (the list can grow
+    # during the day; tomorrow's list picks that up)
+    if (tentative_soon and now.hour >= STILL_TENTATIVE_HOUR
+            and not has(f"STILL TENTATIVE {today.strftime('%-m/%-d')}")):
+        for i, msg in enumerate(still_tentative_texts(tentative_soon, today), 1):
+            if a.dry:
+                actions.append(f"WOULD SEND still-tentative list part {i}:\n"
+                               + "\n".join("      " + l for l in msg.splitlines()))
+            elif _try_send(DERRICK, msg):
+                ok_k = _try_send(KEITA, msg)
+                actions.append(f"Still-tentative list part {i} ({len(tentative_soon)} orders): SENT"
+                               + ("" if ok_k else ", but FAILED to Keita ⚠️"))
+            else:
+                actions.append(f"Still-tentative list part {i}: marker to Derrick FAILED, retry next hour")
 
     # report
     print(f"Ran {now.strftime('%Y-%m-%d %H:%M HST')}. {len(events)} events, "
