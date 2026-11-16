@@ -75,6 +75,9 @@ HEARTBEAT_HOUR = 8  # one liveness ping/day, at ~8am HST
 
 DERRICK = "a5VfxJQzMHa5SrdXXhcP"
 KEITA = "znB4oBW3MVkvkeWwMuIE"
+# Tokina Yamamoto (Hinata, Keita's sister). Derrick 11/16: tentative Hinata jobs also go to her
+# (confirm link + her Hinata-only slice of the 9am still-tentative list). Not on PITCH orders.
+TOKINA = "ePo1gPjtdAahhFAFUEck"
 CHEFS = {"Darin": "peVEGm1t884L4bZKuhrJ", "Jon Jon": "ZBS9x5MyTMJNOL6ONlO9", "Nixon": "PQl9jt0IKdVD2qYFCFjQ"}
 # Derrick first: his copy is the dedup marker for the Thanksgiving lane.
 MANAGEMENT = {"Derrick": DERRICK, "Keita": KEITA, "Adam": "nwkHj14UyoZtLvRoV0bG",
@@ -608,6 +611,8 @@ def main():
                 continue
             failed = [name for name, cid in CHEFS.items() if not _try_send(cid, msg)]
             _try_send(KEITA, cc)
+            if o.get("hinata") and o["status"] != "confirmed":
+                _try_send(TOKINA, cc)
             if failed:
                 _try_send(DERRICK, f"⚠️ Catering approval #{no} did NOT reach: {', '.join(failed)}. "
                                    f"Please forward it to them.")
@@ -623,16 +628,29 @@ def main():
     # during the day; tomorrow's list picks that up)
     if (tentative_soon and now.hour >= STILL_TENTATIVE_HOUR
             and not has(f"STILL TENTATIVE {today.strftime('%-m/%-d')}")):
+        marker_ok = False
         for i, msg in enumerate(still_tentative_texts(tentative_soon, today), 1):
             if a.dry:
                 actions.append(f"WOULD SEND still-tentative list part {i}:\n"
                                + "\n".join("      " + l for l in msg.splitlines()))
             elif _try_send(DERRICK, msg):
+                marker_ok = True
                 ok_k = _try_send(KEITA, msg)
                 actions.append(f"Still-tentative list part {i} ({len(tentative_soon)} orders): SENT"
                                + ("" if ok_k else ", but FAILED to Keita ⚠️"))
             else:
                 actions.append(f"Still-tentative list part {i}: marker to Derrick FAILED, retry next hour")
+        # Tokina gets only the Hinata jobs, once, riding on Derrick's marker for the day
+        hinata_soon = [o for o in tentative_soon if o.get("hinata")]
+        if hinata_soon and (a.dry or marker_ok):
+            for i, msg in enumerate(still_tentative_texts(hinata_soon, today), 1):
+                if a.dry:
+                    actions.append(f"WOULD SEND Tokina (Hinata only) part {i}:\n"
+                                   + "\n".join("      " + l for l in msg.splitlines()))
+                else:
+                    ok_t = _try_send(TOKINA, msg)
+                    actions.append(f"Still-tentative Hinata list to Tokina part {i}: "
+                                   + ("SENT" if ok_t else "FAILED ⚠️"))
 
     # report
     print(f"Ran {now.strftime('%Y-%m-%d %H:%M HST')}. {len(events)} events, "
