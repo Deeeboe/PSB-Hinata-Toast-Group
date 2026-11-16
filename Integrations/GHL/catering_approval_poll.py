@@ -54,6 +54,18 @@ ANNOUNCE_AFTER = os.environ.get("ANNOUNCE_AFTER", "2026-10-25T15:00:00-10:00")
 # More than this many brand-new confirmed orders in one run almost certainly means a Toast
 # calendar re-sync re-created old events (it did on 10/23). Hold them for Derrick instead.
 MAX_ANNOUNCE_PER_RUN = 3
+# Orders whose calendar event was created within this window always go out, even when the bulk
+# guard trips: the poller runs hourly, so these are genuinely new, not a re-sync. (11/13: two old
+# orders scrolled out of the dedup window in the same run as two real new ones, Andrea Simpliciano
+# #001778 + Andrew Harrelson #001779; the 4-at-once hold swallowed the real ones too.)
+JUST_CREATED = datetime.timedelta(hours=2)
+# Only orders created this recently can be announced at all. Belt and suspenders for the dedup
+# window: an old order whose marker scrolled out of Derrick's thread is never treated as new again
+# (11/15: April Pagtulingan #001715 re-announced to management 13 days after it was placed).
+NEW_ORDER_MAX_AGE = datetime.timedelta(hours=72)
+# How far back to read Derrick's thread for dedup markers. SMS only (calls and emails don't hold
+# markers). The thread gets ~20 SMS a day, so 2000 covers months.
+DEDUP_READ_LIMIT = 2000
 HEARTBEAT_HOUR = 8  # one liveness ping/day, at ~8am HST
 
 DERRICK = "a5VfxJQzMHa5SrdXXhcP"
@@ -64,6 +76,10 @@ MANAGEMENT = {"Derrick": DERRICK, "Keita": KEITA, "Adam": "nwkHj14UyoZtLvRoV0bG"
               "Zenn": "164HKrXo2bWGiQI9PbH4", "Alisa": "3bB8JWj6tnXXtdvsqcXD"}
 
 HOLIDAY = re.compile(r"Holiday special menus", re.I)
+# Items that exist ONLY on the Thanksgiving menu. The hourly inbox routine rewrites an online
+# order's calendar description when Toast emails info@ (on for holiday orders since 11/16), which
+# drops the "Holiday special menus" header; the items survive the rewrite.
+HOLIDAY_ITEMS = re.compile(r"Thanksgiving Dinner|Herb Crusted Lamb", re.I)
 TG_DATE = datetime.date(2026, 11, 26)
 # Thanksgiving orders created before this were never announced (James Small #001682); they
 # still count in every running total.
@@ -141,7 +157,8 @@ def parse_event(ev):
     cust = ev.get("summary", "").strip()
     m = re.search(r"Customer info:\s*\n([^\n]+)", desc) or (DRAFTER_CUST.search(desc) if online else None)
     if m:
-        cust = m.group(1).strip()
+        # drafter format is "Customer: Name | email | phone"; keep just the name
+        cust = m.group(1).split(" | ", 1)[0].strip()
     km = DRAFTER_KIND.search(desc) if online else None
     kind = km.group(1) if km else ""
     am, dm, rm = DRAFTER_ADDR.search(desc), DELIVER_AT.search(ev.get("summary", "")), REPLACES.search(desc)
@@ -151,7 +168,8 @@ def parse_event(ev):
             "startDateTime": start.get("dateTime") or start.get("date"),
             "guests": gm.group(1) if gm else None, "itemsText": items,
             "dept": classify(items), "status": status,
-            "holiday": bool(HOLIDAY.search(desc)), "phone": pm.group(0) if pm else "",
+            "holiday": bool(HOLIDAY.search(desc) or HOLIDAY_ITEMS.search(items)),
+            "phone": pm.group(0) if pm else "",
             "online": online,
             "paid_online": online or (status == "confirmed" and bool(TOAST_ONLINE_FIRST.search(desc))
                                       and not INVOICE_LINE.search(desc)),
@@ -258,7 +276,19 @@ def tg_tally(orders):
     item_lines = "\n".join(f"{q} {n}" for n, q in sorted(items.items(), key=lambda kv: (-kv[1], kv[0])))
     pickups = " · ".join(f"{t} ({n})" for t, n in slots.items())
     return (f"Running total: {len(orders)} order{'s' if len(orders) != 1 else ''}\n"
-            f"{item_lines}\nPickups: {pickups}")
+            f"{tg_turkey_line(items)}\n{item_lines}\nPickups: {pickups}")
+
+
+def tg_turkey_line(items):
+    """One turkey per Small/Large dinner, minus ALL HAM (no turkey) dinners."""
+    small = sum(q for n, q in items.items() if "THANKSGIVING DINNER" in n.upper() and "(SMALL)" in n.upper())
+    large = sum(q for n, q in items.items() if "THANKSGIVING DINNER" in n.upper() and "(LARGE)" in n.upper())
+    ham_s = sum(q for n, q in items.items() if "ALL HAM" in n.upper() and "(SMALL)" in n.upper())
+    ham_l = sum(q for n, q in items.items() if "ALL HAM" in n.upper() and "(LARGE)" in n.upper())
+    ham = ham_s + ham_l
+    line = (f"🦃 TURKEYS NEEDED: {small + large - ham} "
+            f"({small - ham_s} small + {large - ham_l} large)")
+    return line + (f", plus {ham} ALL HAM dinner{'s' if ham != 1 else ''} (no turkey)" if ham else "")
 
 
 def tg_new_text(o, orders):
@@ -318,27 +348,49 @@ def thanksgiving_lane(tg, has, now, dry):
             actions.append(f"{label}: SENT to management ✅")
 
     fresh = [o for o in tg if (_parse(o["created"]) or announce_after) > announce_after
+             and is_recent(o, now, NEW_ORDER_MAX_AGE)
              and not has("NEW THANKSGIVING ORDER", o["orderNo"])]
-    if len(fresh) > MAX_ANNOUNCE_PER_RUN:  # calendar re-sync guard, same as the chef lane
-        nos = " ".join(f"#{o['orderNo']}" for o in fresh)
+    fresh, held = split_bulk(fresh, now)
+    if held:  # calendar re-sync guard, same as the chef lane
+        nos = " ".join(f"#{o['orderNo']}" for o in held)
         deliver_hold = (f"🦃 NEW THANKSGIVING ORDER hold (NOT sent to management) {nos}\n"
-                        f"{len(fresh)} Thanksgiving orders showed up at once, probably a Toast calendar "
+                        f"{len(held)} older Thanksgiving orders showed up at once, probably a Toast calendar "
                         f"re-sync. I did not text management. Forward any that are actually new.")
         if dry:
-            actions.append(f"WOULD HOLD {len(fresh)} Thanksgiving orders for Derrick: {nos}")
+            actions.append(f"WOULD HOLD {len(held)} Thanksgiving orders for Derrick: {nos}")
         else:
             _try_send(DERRICK, deliver_hold)
-            actions.append(f"HELD {len(fresh)} Thanksgiving orders for Derrick (bulk guard): {nos}")
-        fresh = []
+            actions.append(f"HELD {len(held)} Thanksgiving orders for Derrick (bulk guard): {nos}")
     for o in sorted(fresh, key=lambda o: o["created"] or ""):
         deliver(f"Thanksgiving #{o['orderNo']} {o['customer']}", tg_new_text(o, tg))
 
-    if today == TG_FINAL_COUNT_DAY and now.hour >= TG_SEND_HOUR and not has("THANKSGIVING FINAL COUNT"):
+    # Final count: 9am on 11/21, or the first run after that if the whole morning failed, up to
+    # pickup day. (Before 11/16 it only tried on 11/21 itself, so one bad day meant no count.)
+    final_due = (today == TG_FINAL_COUNT_DAY and now.hour >= TG_SEND_HOUR) or TG_FINAL_COUNT_DAY < today <= TG_DATE
+    if final_due and not has("THANKSGIVING FINAL COUNT"):
         deliver("Thanksgiving final count", tg_final_text(tg), extra={"Darin": CHEFS["Darin"]})
-    if today == TG_DATE and now.hour >= TG_SEND_HOUR and tg and not has("THANKSGIVING PICKUP SHEET"):
+    if today == TG_DATE and now.hour >= TG_SEND_HOUR and tg:
+        # each part has its own marker, so a part that failed is retried next hour
         for i, msg in enumerate(tg_pickup_texts(tg), 1):
-            deliver(f"Thanksgiving pickup sheet part {i}", msg)
+            marker = msg.split(" · ", 1)[0].replace("🦃", "").strip()  # "THANKSGIVING PICKUP SHEET (2/3)"
+            if not has(marker):
+                deliver(f"Thanksgiving pickup sheet part {i}", msg)
     return actions
+
+
+def is_recent(o, now, max_age):
+    c = _parse(o.get("created"))
+    return c is not None and now - c <= max_age
+
+
+def split_bulk(fresh, now):
+    """(send, hold). More than MAX_ANNOUNCE_PER_RUN at once usually means a Toast calendar re-sync,
+    so hold them for Derrick, EXCEPT orders created in the last JUST_CREATED (hourly runs, so those
+    are really new and must never be swallowed by the hold)."""
+    if len(fresh) <= MAX_ANNOUNCE_PER_RUN:
+        return fresh, []
+    new = [o for o in fresh if is_recent(o, now, JUST_CREATED)]
+    return new, [o for o in fresh if o not in new]
 
 
 def _one_per_order(orders):
@@ -431,7 +483,9 @@ def main():
     # 200, not 50: an order can sit for days between the heads-up and approval, and
     # this thread is busy (call recaps, omakase alerts, CCs). Too small a window
     # makes the "already sent" marker scroll out and the chefs get blasted again.
-    derrick_msgs = get_recent_messages(DERRICK, limit=200)
+    # 11/16: 200 was still too small (~10 days); markers scrolled out and old orders were
+    # re-announced. Read SMS only, much further back (see DEDUP_READ_LIMIT), plus the age guard.
+    derrick_msgs = get_recent_messages(DERRICK, limit=DEDUP_READ_LIMIT, msg_type="TYPE_SMS")
 
     # FAIL SAFE (do not remove): an empty read means we could not SEE the thread,
     # it does NOT mean nothing was ever sent. Without this guard, one transient GHL
@@ -456,25 +510,31 @@ def main():
         return False
 
     actions = []
-    fresh_confirmed = [o for o in cands if o["status"] == "confirmed" and not sent(o["orderNo"])]
-    if len(fresh_confirmed) > MAX_ANNOUNCE_PER_RUN:
-        nos = " ".join(f"#{o['orderNo']}" for o in fresh_confirmed)
+    fresh_confirmed = [o for o in cands if o["status"] == "confirmed" and not sent(o["orderNo"])
+                       and is_recent(o, now, NEW_ORDER_MAX_AGE)]
+    _, held_confirmed = split_bulk(fresh_confirmed, now)
+    if held_confirmed:
+        nos = " ".join(f"#{o['orderNo']}" for o in held_confirmed)
         hold = (f"📋 CC (sent: bulk hold, NOT sent to chefs) {nos}\n"
-                f"{len(fresh_confirmed)} confirmed orders showed up at once, probably a Toast calendar "
+                f"{len(held_confirmed)} older confirmed orders showed up at once, probably a Toast calendar "
                 f"re-sync of old orders. I did not text the chefs. Forward any that are actually new.")
         if a.dry:
-            actions.append(f"WOULD HOLD {len(fresh_confirmed)} confirmed orders for Derrick: {nos}")
+            actions.append(f"WOULD HOLD {len(held_confirmed)} confirmed orders for Derrick: {nos}")
         elif _try_send(DERRICK, hold):
-            actions.append(f"HELD {len(fresh_confirmed)} confirmed orders for Derrick (bulk guard): {nos}")
+            actions.append(f"HELD {len(held_confirmed)} confirmed orders for Derrick (bulk guard): {nos}")
         else:
             actions.append(f"bulk-hold note to Derrick FAILED, sent nothing, retry next hour: {nos}")
-        held = {o["orderNo"] for o in fresh_confirmed}
+        held = {o["orderNo"] for o in held_confirmed}
         cands = [o for o in cands if o["orderNo"] not in held]
 
     for o in cands:
         no = o["orderNo"]
         if sent(no):
             actions.append(f"#{no} {o['customer']}: already sent to chefs — skip")
+            continue
+        if not is_recent(o, now, NEW_ORDER_MAX_AGE):
+            # its marker scrolled out of the read window; it was handled when it was new
+            actions.append(f"#{no} {o['customer']}: created over {NEW_ORDER_MAX_AGE.days} days ago, not new — skip")
             continue
         if has("HOLD", no, direction="inbound"):  # legacy holds from the old heads-up flow
             actions.append(f"#{no} {o['customer']}: HOLD by Derrick — held")

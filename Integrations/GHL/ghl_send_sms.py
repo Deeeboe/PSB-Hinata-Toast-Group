@@ -55,7 +55,7 @@ def _get(url, pit):
         sys.exit(f"ERROR: GHL GET network failure: {e}")
 
 
-def get_recent_messages(contact_id, limit=30):
+def get_recent_messages(contact_id, limit=30, msg_type=None):
     """Return up to `limit` recent messages for a contact's conversation:
     [{direction, body}].
 
@@ -71,8 +71,11 @@ def get_recent_messages(contact_id, limit=30):
         return []
     conv_id = convs[0]["id"]
     out, last_id, guard = [], None, 0
-    while len(out) < limit and guard < 12:
+    max_pages = max(12, limit // 20 + 2)  # pages can hold fewer than 100; never cap below the limit
+    while len(out) < limit and guard < max_pages:
         url = f"{BASE}/conversations/{conv_id}/messages?limit=100"
+        if msg_type:  # e.g. "TYPE_SMS": dedup markers are SMS, skip calls/emails
+            url += f"&type={msg_type}"
         if last_id:
             url += f"&lastMessageId={last_id}"
         m = _get(url, pit)
